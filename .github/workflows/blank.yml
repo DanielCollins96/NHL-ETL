@@ -1,0 +1,32 @@
+# .github/workflows/etl.yml
+name: NHL Roster ETL
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Runs at 2 AM UTC daily
+  workflow_dispatch:  # Manual trigger from GitHub UI
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout ETL repo
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install scraper from GitHub
+        run: pip install git+https://${{ secrets.GH_PAT }}@github.com/DanielCollins96/NHLScraper.git
+      
+      - name: Install ETL dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run ETL
+        run: python run_etl.py
+        env:
+          DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
