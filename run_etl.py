@@ -75,6 +75,30 @@ async def main():
             conn.commit()
         logger.info("✓ Roster sync completed")
         
+        # Step 7: Scrape detailed player data for new players
+        if len(new_ids) > 0:
+            logger.info(f"Scraping detailed data for {len(new_ids)} players...")
+            await scraper.scrape_all_players(new_ids)
+            logger.info("✓ Player data scraped and loaded to staging")
+            
+            # Step 8: Sync player data
+            logger.info("Running player sync procedures...")
+            with engine.connect() as conn:
+                logger.info("  - Syncing players...")
+                conn.execute(text("CALL sync_players_from_staging()"))
+                conn.commit()
+                
+                logger.info("  - Syncing season skaters...")
+                conn.execute(text("CALL sync_season_skaters_from_staging()"))
+                conn.commit()
+                
+                logger.info("  - Syncing season goalies...")
+                conn.execute(text("CALL sync_season_goalies_from_staging()"))
+                conn.commit()
+            logger.info("✓ All player sync procedures completed")
+        else:
+            logger.info("No new players to scrape detailed data for")
+        
         # Success summary
         duration = (datetime.now() - start_time).total_seconds()
         logger.info("="*60)
