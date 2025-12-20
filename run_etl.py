@@ -78,7 +78,7 @@ async def main():
         # Step 7: Scrape detailed player data for new players
         if len(new_ids) > 0:
             logger.info(f"Scraping detailed data for {len(new_ids)} players...")
-            await scraper.scrape_all_players(new_ids)
+            await scraper.scrape_all_players(new_ids, engine)
             logger.info("✓ Player data scraped and loaded to staging")
             
             # Step 8: Sync player data
