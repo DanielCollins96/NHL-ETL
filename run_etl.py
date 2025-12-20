@@ -32,6 +32,7 @@ async def main():
         with engine.connect() as connection:
             logger.info("✓ Database connection successful!")
         
+        # ========== PIPELINE 1: ROSTERS ==========
         # Step 1: Scrape current rosters from NHL API
         logger.info("Scraping current rosters from NHL API...")
         current_data = await scraper.scrape_all_rosters()
@@ -99,14 +100,42 @@ async def main():
         else:
             logger.info("No new players to scrape detailed data for")
         
+        # ========== PIPELINE 2: CURRENT SEASON STATS ==========
+        # Step 9: Scrape current season stats
+        logger.info("Scraping current season stats...")
+        current_season_data = await scraper.scrape_current_season()
+        skaters_df = current_season_data['skaters']
+        goalies_df = current_season_data['goalies']
+        logger.info(f"✓ Scraped {len(skaters_df)} skater records and {len(goalies_df)} goalie records")
+        
+        # Step 10: Load season stats to staging
+        logger.info("Loading season stats to staging tables...")
+        skaters_df.to_sql('skaters', engine, if_exists='replace', index=False, schema='staging1')
+        goalies_df.to_sql('goalies', engine, if_exists='replace', index=False, schema='staging1')
+        logger.info("✓ Skaters and goalies data loaded to staging")
+        
+        # Step 11: Sync season stats
+        logger.info("Running season stats sync procedures...")
+        with engine.connect() as conn:
+            logger.info("  - Syncing skaters from staging...")
+            conn.execute(text("CALL sync_skaters_from_staging()"))
+            conn.commit()
+            
+            logger.info("  - Syncing goalies from staging...")
+            conn.execute(text("CALL sync_goalies_from_staging()"))
+            conn.commit()
+        logger.info("✓ Season stats sync completed")
+        
         # Success summary
         duration = (datetime.now() - start_time).total_seconds()
         logger.info("="*60)
         logger.info("ETL SUMMARY")
         logger.info("="*60)
-        logger.info(f"Total records processed: {len(current_data)}")
+        logger.info(f"Roster records processed: {len(current_data)}")
         logger.info(f"New call-ups: {len(new_players)}")
         logger.info(f"Send-downs: {len(missing_players)}")
+        logger.info(f"Season skaters: {len(skaters_df)}")
+        logger.info(f"Season goalies: {len(goalies_df)}")
         logger.info(f"Duration: {duration:.2f} seconds")
         logger.info(f"Status: SUCCESS ✓")
         logger.info("="*60)
