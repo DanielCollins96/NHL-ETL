@@ -2,7 +2,7 @@
 name: NHL Roster ETL
 on:
   schedule:
-    - cron: '0 1,7 * * *'  # Runs at 2 AM UTC daily
+    - cron: '0 1,7 * * *'  # Runs at 1+7 AM UTC daily
   workflow_dispatch:  # Manual trigger from GitHub UI
 jobs:
   run-etl:
