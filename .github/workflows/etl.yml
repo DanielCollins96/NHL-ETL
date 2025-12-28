@@ -29,3 +29,4 @@ jobs:
         run: python run_etl.py
         env:
           DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
+          DB_CONNECTION_2: ${{ secrets.DB_CONNECTION_2 }}
