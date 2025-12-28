@@ -161,7 +161,8 @@ async def main():
     
     if connection_string_2:
         db_configs.append({"name": "secondary", "connection_string": connection_string_2})
-        logger.info(f"Found {len(db_configs)} database connections to process")
+    
+    logger.info(f"Found {len(db_configs)} database connection(s) to process")
     
     scraper = NHLScraper()
     
