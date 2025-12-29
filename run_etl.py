@@ -14,10 +14,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def run_etl_for_db(engine, scraper, db_name="primary"):
+async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="primary"):
     """Run the NHL roster ETL process for a single database."""
     start_time = datetime.now()
     logger.info(f"Starting NHL roster ETL for {db_name} database")
+    
+    current_data = roster_data
+    skaters_df = season_data['skaters']
+    goalies_df = season_data['goalies']
     
     try:
         # Test the connection
@@ -26,10 +30,7 @@ async def run_etl_for_db(engine, scraper, db_name="primary"):
             logger.info(f"[{db_name}] ✓ Database connection successful!")
         
         # ========== PIPELINE 1: ROSTERS ==========
-        # Step 1: Scrape current rosters from NHL API
-        logger.info(f"[{db_name}] Scraping current rosters from NHL API...")
-        current_data = await scraper.scrape_all_rosters()
-        logger.info(f"[{db_name}] ✓ Scraped {len(current_data)} roster records")
+        logger.info(f"[{db_name}] Using {len(current_data)} roster records from scraper")
         
         # Step 2: Load existing active rosters from database
         logger.info(f"[{db_name}] Loading existing active rosters from database...")
@@ -94,12 +95,7 @@ async def run_etl_for_db(engine, scraper, db_name="primary"):
             logger.info(f"[{db_name}] No new players to scrape detailed data for")
         
         # ========== PIPELINE 2: CURRENT SEASON STATS ==========
-        # Step 9: Scrape current season stats
-        logger.info(f"[{db_name}] Scraping current season stats...")
-        current_season_data = await scraper.scrape_current_season()
-        skaters_df = current_season_data['skaters']
-        goalies_df = current_season_data['goalies']
-        logger.info(f"[{db_name}] ✓ Scraped {len(skaters_df)} skater records and {len(goalies_df)} goalie records")
+        logger.info(f"[{db_name}] Using {len(skaters_df)} skater records and {len(goalies_df)} goalie records from scraper")
         
         # Step 10: Load season stats to staging
         logger.info(f"[{db_name}] Loading season stats to staging tables...")
@@ -166,13 +162,22 @@ async def main():
     
     scraper = NHLScraper()
     
+    # Scrape all data once upfront
+    logger.info("Scraping roster data from NHL API...")
+    roster_data = await scraper.scrape_all_rosters()
+    logger.info(f"✓ Scraped {len(roster_data)} roster records")
+    
+    logger.info("Scraping current season stats from NHL API...")
+    season_data = await scraper.scrape_current_season()
+    logger.info(f"✓ Scraped {len(season_data['skaters'])} skaters and {len(season_data['goalies'])} goalies")
+    
     # Run ETL for each database, tracking successes and failures
     failed_dbs = []
     succeeded_dbs = []
     for db_config in db_configs:
         engine = create_engine(db_config["connection_string"])
         try:
-            await run_etl_for_db(engine, scraper, db_config["name"])
+            await run_etl_for_db(engine, scraper, roster_data, season_data, db_config["name"])
             succeeded_dbs.append(db_config["name"])
         except Exception as e:
             logger.error(f"ETL failed for {db_config['name']} database: {e}. Continuing with remaining databases...")
