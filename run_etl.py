@@ -166,20 +166,31 @@ async def main():
     
     scraper = NHLScraper()
     
-    # Run ETL for each database, tracking failures
+    # Run ETL for each database, tracking successes and failures
     failed_dbs = []
+    succeeded_dbs = []
     for db_config in db_configs:
         engine = create_engine(db_config["connection_string"])
         try:
             await run_etl_for_db(engine, scraper, db_config["name"])
+            succeeded_dbs.append(db_config["name"])
         except Exception as e:
             logger.error(f"ETL failed for {db_config['name']} database: {e}. Continuing with remaining databases...")
             failed_dbs.append(db_config["name"])
     
     # Report overall status
+    total = len(db_configs)
+    logger.info("="*60)
+    logger.info(f"OVERALL ETL SUMMARY: {len(succeeded_dbs)}/{total} databases succeeded")
+    if succeeded_dbs:
+        logger.info(f"Succeeded: {succeeded_dbs}")
     if failed_dbs:
-        logger.error(f"ETL completed with failures. Failed databases: {failed_dbs}")
-        raise RuntimeError(f"ETL failed for databases: {failed_dbs}")
+        logger.warning(f"Failed: {failed_dbs}")
+    logger.info("="*60)
+    
+    # Only fail if ALL databases failed
+    if len(failed_dbs) == total:
+        raise RuntimeError(f"ETL failed for ALL databases: {failed_dbs}")
 
 if __name__ == "__main__":
     asyncio.run(main())
