@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from nhl_scraper import NHLScraper
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 import pandas as pd
 
 # Set up logging
@@ -34,7 +35,8 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="pri
         
         # Step 2: Load existing active rosters from database
         logger.info(f"[{db_name}] Loading existing active rosters from database...")
-        active_rosters = pd.read_sql('SELECT * FROM newapi.rosters_active', engine)
+        with engine.connect() as conn:
+            active_rosters = pd.read_sql('SELECT * FROM newapi.rosters_active', conn)
         logger.info(f"[{db_name}] ✓ Loaded {len(active_rosters)} existing active roster records")
         
         # Step 3: Identify new players (call-ups)
@@ -54,20 +56,25 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="pri
         
         # Step 5: Load current data to staging table
         logger.info(f"[{db_name}] Loading current roster data to staging table...")
-        current_data.to_sql(
-            'current_rosters',
-            engine,
-            schema='staging1',
-            if_exists='replace',
-            index=False
-        )
+        try:
+            with engine.begin() as conn:
+                current_data.to_sql(
+                    'current_rosters',
+                    conn,
+                    schema='staging1',
+                    if_exists='replace',
+                    index=False
+                )
+        except SQLAlchemyError:
+            # Ensure we don't return a connection to the pool in a broken txn state.
+            logger.exception(f"[{db_name}] Failed loading staging1.current_rosters; transaction rolled back")
+            raise
         logger.info(f"[{db_name}] ✓ Data loaded to staging1.current_rosters")
         
         # Step 6: Run stored procedure to sync rosters
         logger.info(f"[{db_name}] Running sync_rosters_from_staging procedure...")
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(text("CALL sync_rosters_from_staging()"))
-            conn.commit()
         logger.info(f"[{db_name}] ✓ Roster sync completed")
         
         # Step 7: Scrape detailed player data for new players
@@ -78,18 +85,15 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="pri
             
             # Step 8: Sync player data
             logger.info(f"[{db_name}] Running player sync procedures...")
-            with engine.connect() as conn:
+            with engine.begin() as conn:
                 logger.info(f"[{db_name}]   - Syncing players...")
                 conn.execute(text("CALL sync_players_from_staging()"))
-                conn.commit()
-                
+
                 logger.info(f"[{db_name}]   - Syncing season skaters...")
                 conn.execute(text("CALL sync_season_skaters_from_staging()"))
-                conn.commit()
-                
+
                 logger.info(f"[{db_name}]   - Syncing season goalies...")
                 conn.execute(text("CALL sync_season_goalies_from_staging()"))
-                conn.commit()
             logger.info(f"[{db_name}] ✓ All player sync procedures completed")
         else:
             logger.info(f"[{db_name}] No new players to scrape detailed data for")
@@ -99,20 +103,23 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="pri
         
         # Step 10: Load season stats to staging
         logger.info(f"[{db_name}] Loading season stats to staging tables...")
-        skaters_df.to_sql('skaters', engine, if_exists='replace', index=False, schema='staging1')
-        goalies_df.to_sql('goalies', engine, if_exists='replace', index=False, schema='staging1')
+        try:
+            with engine.begin() as conn:
+                skaters_df.to_sql('skaters', conn, if_exists='replace', index=False, schema='staging1')
+                goalies_df.to_sql('goalies', conn, if_exists='replace', index=False, schema='staging1')
+        except SQLAlchemyError:
+            logger.exception(f"[{db_name}] Failed loading staging1 skaters/goalies; transaction rolled back")
+            raise
         logger.info(f"[{db_name}] ✓ Skaters and goalies data loaded to staging")
         
         # Step 11: Sync season stats
         logger.info(f"[{db_name}] Running season stats sync procedures...")
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             logger.info(f"[{db_name}]   - Syncing skaters from staging...")
             conn.execute(text("CALL sync_skaters_from_staging()"))
-            conn.commit()
-            
+
             logger.info(f"[{db_name}]   - Syncing goalies from staging...")
             conn.execute(text("CALL sync_goalies_from_staging()"))
-            conn.commit()
         logger.info(f"[{db_name}] ✓ Season stats sync completed")
         
         # Success summary
@@ -175,7 +182,13 @@ async def main():
     failed_dbs = []
     succeeded_dbs = []
     for db_config in db_configs:
-        engine = create_engine(db_config["connection_string"])
+        # Pre-ping reduces failures from stale/closed connections.
+        # Recycle helps in environments with aggressive connection timeouts.
+        engine = create_engine(
+            db_config["connection_string"],
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
         try:
             await run_etl_for_db(engine, scraper, roster_data, season_data, db_config["name"])
             succeeded_dbs.append(db_config["name"])
