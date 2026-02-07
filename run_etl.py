@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="primary"):
+async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, db_name="primary"):
     """Run the NHL roster ETL process for a single database."""
     start_time = datetime.now()
     logger.info(f"Starting NHL roster ETL for {db_name} database")
@@ -122,6 +122,38 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, db_name="pri
             conn.execute(text("CALL sync_goalies_from_staging()"))
         logger.info(f"[{db_name}] ✓ Season stats sync completed")
         
+        # ========== PIPELINE 3: TEAMS & GAMES ==========
+        try:
+            logger.info(f"[{db_name}] Loading teams/gametypes/franchises/team_season to staging...")
+            with engine.begin() as conn:
+                team_data['teams'].to_sql('teams', conn, schema='staging1', if_exists='replace', index=False)
+                team_data['gametypes'].to_sql('team_gametypes', conn, schema='staging1', if_exists='replace', index=False)
+                team_data['franchises'].to_sql('franchises', conn, schema='staging1', if_exists='replace', index=False)
+                team_data['team_season'].to_sql('team_season', conn, schema='staging1', if_exists='replace', index=False)
+            logger.info(f"[{db_name}] ✓ Teams-related data loaded to staging")
+            
+            logger.info(f"[{db_name}] Running team sync procedure...")
+            with engine.begin() as conn:
+                conn.execute(text("CALL sync_all_teams_from_staging()"))
+            logger.info(f"[{db_name}] ✓ Team sync completed")
+        except SQLAlchemyError:
+            logger.exception(f"[{db_name}] Failed loading teams-related staging; transaction rolled back")
+            raise
+        
+        try:
+            logger.info(f"[{db_name}] Loading games to staging...")
+            with engine.begin() as conn:
+                team_data['games'].to_sql('games', conn, schema='staging1', if_exists='replace', index=False)
+            logger.info(f"[{db_name}] ✓ Games loaded to staging")
+            
+            logger.info(f"[{db_name}] Running games sync procedure...")
+            with engine.begin() as conn:
+                conn.execute(text("CALL sync_games_from_staging()"))
+            logger.info(f"[{db_name}] ✓ Games sync completed")
+        except SQLAlchemyError:
+            logger.exception(f"[{db_name}] Failed loading games staging; transaction rolled back")
+            raise
+        
         # Success summary
         duration = (datetime.now() - start_time).total_seconds()
         logger.info("="*60)
@@ -168,16 +200,38 @@ async def main():
     logger.info(f"Found {len(db_configs)} database connection(s) to process")
     
     scraper = NHLScraper()
-    
+
     # Scrape all data once upfront
     logger.info("Scraping roster data from NHL API...")
     roster_data = await scraper.scrape_all_rosters()
     logger.info(f"✓ Scraped {len(roster_data)} roster records")
-    
+
     logger.info("Scraping current season stats from NHL API...")
     season_data = await scraper.scrape_current_season()
     logger.info(f"✓ Scraped {len(season_data['skaters'])} skaters and {len(season_data['goalies'])} goalies")
-    
+
+    # Scrape teams, franchises, team summaries, and games
+    logger.info("Scraping teams, franchises, team summaries and games from NHL API...")
+    teams = scraper.get_all_teams()
+    logger.info(f"✓ Scraped {len(teams)} teams")
+    abrevs = teams['triCode'].unique().tolist()
+    gametypes_all = await scraper.scrape_team_gametypes(abrevs)
+    logger.info(f"✓ Scraped team gametypes")
+    franchises = scraper.get_all_franchises()
+    logger.info(f"✓ Scraped {len(franchises)} franchises")
+    team_season = scraper.get_team_summary(current_season_only=False)
+    logger.info(f"✓ Scraped {len(team_season)} team-season records")
+    games = scraper.scrape_all_games_to_dataframe()
+    logger.info(f"✓ Scraped {len(games)} games")
+
+    team_data = {
+        "teams": teams,
+        "gametypes": gametypes_all,
+        "franchises": franchises,
+        "team_season": team_season,
+        "games": games,
+    }
+
     # Run ETL for each database, tracking successes and failures
     failed_dbs = []
     succeeded_dbs = []
@@ -190,7 +244,7 @@ async def main():
             pool_recycle=1800,
         )
         try:
-            await run_etl_for_db(engine, scraper, roster_data, season_data, db_config["name"])
+            await run_etl_for_db(engine, scraper, roster_data, season_data, team_data, db_config["name"])
             succeeded_dbs.append(db_config["name"])
         except Exception as e:
             logger.error(f"ETL failed for {db_config['name']} database: {e}. Continuing with remaining databases...")
