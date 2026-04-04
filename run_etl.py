@@ -1,11 +1,22 @@
-import json
 import pandas as pd
+import json
+import logging
 
-# Assuming 'games' is your DataFrame
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
 
-# Serialize dict columns to JSON
-for column in games.select_dtypes(include=['object']):
-    if isinstance(games[column].iloc[0], dict):
-        games[column] = games[column].apply(json.dumps)
+def serialize_dict_columns(df):
+    # Identify object-type columns containing dicts or lists
+    for column in df.select_dtypes(include=['object']):
+        if df[column].apply(lambda x: isinstance(x, (dict, list))).any():
+            logging.info(f'Serializing column: {column}')
+            df[column] = df[column].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
+    return df
 
-# Then you can insert the DataFrame into the database
+# Load your data into a DataFrame
+# df = pd.read_csv('your_data.csv')  # Example loading step
+
+# Apply the serialization function
+# df = serialize_dict_columns(df)
+
+# Now you would continue with your ETL process, including inserting into your database
