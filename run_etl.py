@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import logging
 from datetime import datetime
@@ -13,6 +14,27 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def sanitize_games_dataframe(games_df):
+    games_df = games_df.copy()
+    sanitized_columns = []
+
+    for column in games_df.select_dtypes(include="object"):
+        series = games_df[column]
+        if not series.map(lambda value: isinstance(value, (dict, list, tuple, set))).any():
+            continue
+
+        games_df[column] = series.map(
+            lambda value: json.dumps(
+                sorted(value) if isinstance(value, set) else list(value) if isinstance(value, tuple) else value,
+                ensure_ascii=False,
+                sort_keys=True,
+            ) if isinstance(value, (dict, list, tuple, set)) else value
+        )
+        sanitized_columns.append(column)
+
+    return games_df, sanitized_columns
 
 
 async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, db_name="primary"):
@@ -142,8 +164,13 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         
         try:
             logger.info(f"[{db_name}] Loading games to staging...")
+            games_df, sanitized_columns = sanitize_games_dataframe(team_data['games'])
+            if sanitized_columns:
+                logger.warning(
+                    f"[{db_name}] Serialized nested games payload columns before load: {sanitized_columns}"
+                )
             with engine.begin() as conn:
-                team_data['games'].to_sql('games', conn, schema='staging1', if_exists='replace', index=False)
+                games_df.to_sql('games', conn, schema='staging1', if_exists='replace', index=False)
             logger.info(f"[{db_name}] ✓ Games loaded to staging")
             
             logger.info(f"[{db_name}] Running games sync procedure...")
