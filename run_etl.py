@@ -180,6 +180,38 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         except SQLAlchemyError:
             logger.exception(f"[{db_name}] Failed loading games staging; transaction rolled back")
             raise
+        # ========== PIPELINE 4: GAMECENTER PLAY-BY-PLAY ==========
+        try:
+            logger.info(f"[{db_name}] Fetching and staging gamecenter play-by-play...")
+
+            # Determine game id column robustly
+            games_df = team_data['games']
+            if 'id' in games_df.columns:
+                gid_col = 'id'
+            elif 'gameId' in games_df.columns:
+                gid_col = 'gameId'
+            else:
+                gid_col = None
+
+            if gid_col is None:
+                logger.warning(f"[{db_name}] Could not determine game id column; skipping gamecenter staging")
+            else:
+                game_ids = games_df[gid_col].dropna().astype(int).unique().tolist()
+                logger.info(f"[{db_name}] Scraping play-by-play for {len(game_ids)} games (this may take a few minutes)...")
+                gamecenter_df = scraper.get_gamecenter_staging_data(game_ids, delay=0.01)
+
+                if gamecenter_df is not None and not gamecenter_df.empty:
+                    with engine.begin() as conn:
+                        gamecenter_df.to_sql('gamecenter', conn, schema='staging1', if_exists='replace', index=False)
+                    logger.info(f"[{db_name}] ✓ Staged {len(gamecenter_df)} gamecenter rows to staging1.gamecenter")
+                    
+                    logger.info(f"[{db_name}] Running sync_gamecenter_from_staging procedure...")
+                    with engine.begin() as conn:
+                        conn.execute(text("CALL sync_gamecenter_from_staging()"))
+                    logger.info(f"[{db_name}] ✓ Gamecenter sync completed")
+        except SQLAlchemyError:
+            logger.exception(f"[{db_name}] Failed during gamecenter staging/sync; transaction rolled back")
+            raise
         
         # Success summary
         duration = (datetime.now() - start_time).total_seconds()
