@@ -9,7 +9,7 @@ Environment:
   READ_MODEL_DRY_RUN                     true/false. Defaults to false.
   READ_MODEL_UPLOAD_WORKERS              Concurrent S3 uploads. Defaults to 8.
   READ_MODEL_MAX_OBJECTS                 Optional limit for testing.
-  READ_MODEL_EXPORT_GROUPS               Optional comma-separated groups: games, players, teams, seasons, drafts, indexes.
+  READ_MODEL_EXPORT_GROUPS               Optional comma-separated groups: games, players, teams, seasons, drafts, contracts, indexes.
   READ_MODEL_INCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
   READ_MODEL_EXCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
   CLOUDFRONT_DISTRIBUTION_ID             Optional distribution to invalidate.
@@ -26,10 +26,14 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import boto3
 from botocore.config import Config
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 logging.basicConfig(
@@ -48,6 +52,7 @@ EXPORT_GROUP_PREFIXES = {
     "teams": ["teams/", "indexes/teams.json", "indexes/team-ids.json", "indexes/team-rosters.json"],
     "seasons": ["seasons/"],
     "drafts": ["drafts/", "indexes/draft-years.json"],
+    "contracts": ["contracts/", "indexes/contract-player-ids.json"],
     "indexes": ["indexes/"],
     "games": ["games/", "indexes/game-date-range.json"],
 }

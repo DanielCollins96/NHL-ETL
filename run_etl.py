@@ -3,10 +3,14 @@ import json
 import os
 import logging
 from datetime import datetime
+from pathlib import Path
 from nhl_scraper import NHLScraper
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
 import pandas as pd
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Set up logging
 logging.basicConfig(
@@ -26,6 +30,18 @@ PIPELINE_ALIASES = {
     "today": {"daily_rosters"},
     "schedule_now": {"daily_rosters"},
 }
+
+
+def parse_positive_int_env(name, default):
+    """Parse a positive integer environment variable."""
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    value = int(raw_value)
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1")
+    return value
 
 
 def parse_etl_pipelines(value):
@@ -388,6 +404,17 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
                         if_exists='replace',
                         index=False,
                     )
+                    for table_name in ("game_goals", "game_penalties", "game_three_stars"):
+                        summary_df = daily_data.get(table_name)
+                        if summary_df is not None:
+                            summary_df.to_sql(
+                                table_name,
+                                conn,
+                                schema='staging1',
+                                if_exists='replace',
+                                index=False,
+                            )
+                            logger.info(f"[{db_name}] ✓ {table_name} loaded to staging ({len(summary_df)} rows)")
 
                 summary["schedule_now_games"] = len(schedule_now_games_df)
                 summary["game_roster_rows"] = len(game_rosters_df)
@@ -445,6 +472,8 @@ async def main():
     pipelines = parse_etl_pipelines(os.getenv("ETL_PIPELINES", "all"))
     ordered_pipelines = [name for name in PIPELINE_ORDER if name in pipelines]
     gamecenter_game_ids = parse_gamecenter_game_ids(os.getenv("GAMECENTER_GAME_IDS"))
+    schedule_lookback_days = parse_positive_int_env("SCHEDULE_LOOKBACK_DAYS", 1)
+    schedule_end_date = os.getenv("SCHEDULE_END_DATE") or None
     
     if not connection_string:
         raise ValueError("DB_CONNECTION environment variable not set")
@@ -461,6 +490,11 @@ async def main():
     logger.info(f"Enabled ETL pipelines: {ordered_pipelines}")
     if gamecenter_game_ids:
         logger.info(f"Restricting gamecenter to {len(gamecenter_game_ids)} GAMECENTER_GAME_IDS")
+    if "daily_rosters" in pipelines:
+        logger.info(
+            f"Daily roster schedule window: last {schedule_lookback_days} day(s)"
+            f"{f' ending {schedule_end_date}' if schedule_end_date else ''}"
+        )
     
     scraper = NHLScraper()
 
@@ -518,10 +552,20 @@ async def main():
         team_data["gamecenter_game_ids"] = gamecenter_game_ids
 
     if "daily_rosters" in pipelines:
-        logger.info("Scraping current /schedule/now games from NHL API...")
-        daily_data = await scraper.scrape_schedule_now_game_rosters()
+        if schedule_lookback_days > 1 or schedule_end_date:
+            logger.info("Scraping recent schedule games from NHL API...")
+            daily_data = await scraper.scrape_recent_schedule_game_rosters(
+                days=schedule_lookback_days,
+                end_date=schedule_end_date,
+            )
+            schedule_label = f"last {schedule_lookback_days} day(s)"
+        else:
+            logger.info("Scraping current /schedule/now games from NHL API...")
+            daily_data = await scraper.scrape_schedule_now_game_rosters()
+            schedule_label = "/schedule/now"
+
         logger.info(
-            f"✓ Prepared {len(daily_data['games'])} /schedule/now games and "
+            f"✓ Prepared {len(daily_data['games'])} {schedule_label} games and "
             f"{len(daily_data['game_rosters'])} game roster rows for teams: {daily_data['teams']}"
         )
     else:
