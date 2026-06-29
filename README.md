@@ -13,6 +13,14 @@ cp .env.example .env
 python run_etl.py
 ```
 
+Run only the drafts pipeline with:
+
+```
+ETL_PIPELINES=drafts python run_etl.py
+```
+
+`draft` is also accepted as an alias. The pipeline loads `staging1.drafts` and then calls `sync_drafts_from_staging()`.
+
 ## Multiple Database Connections
 
 To run the ETL against multiple databases, set the `DB_CONNECTION_2` environment variable:

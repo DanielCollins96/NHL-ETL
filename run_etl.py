@@ -19,11 +19,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PIPELINE_ORDER = ("rosters", "players", "season_stats", "teams", "games", "gamecenter", "daily_rosters")
+PIPELINE_ORDER = ("rosters", "players", "season_stats", "teams", "drafts", "games", "gamecenter", "daily_rosters")
 FULL_PIPELINES = set(PIPELINE_ORDER) - {"gamecenter", "daily_rosters"}
 PIPELINE_ALIASES = {
     "all": FULL_PIPELINES,
     "full": FULL_PIPELINES,
+    "draft": {"drafts"},
     "daily": {"games"},
     "games_gamecenter": {"games", "gamecenter"},
     "gamecenter_only": {"gamecenter"},
@@ -110,7 +111,7 @@ def sanitize_games_dataframe(games_df):
     return games_df, sanitized_columns
 
 
-async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, daily_data, pipelines, db_name="primary"):
+async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, draft_data, daily_data, pipelines, db_name="primary"):
     """Run the NHL roster ETL process for a single database."""
     start_time = datetime.now()
     ordered_pipelines = [name for name in PIPELINE_ORDER if name in pipelines]
@@ -122,6 +123,7 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         "season_skaters": None,
         "season_goalies": None,
         "teams": None,
+        "drafts": None,
         "games": None,
         "gamecenter_games": None,
         "gamecenter_rows": None,
@@ -247,7 +249,7 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         else:
             logger.info(f"[{db_name}] Skipping current season skater/goalie stats")
         
-        # ========== PIPELINE 3: TEAMS & GAMES ==========
+        # ========== PIPELINE 3: TEAMS ==========
         team_data = team_data or {}
         if "teams" in pipelines:
             try:
@@ -270,6 +272,29 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         else:
             logger.info(f"[{db_name}] Skipping teams/franchises/team season sync")
 
+        # ========== PIPELINE 4: DRAFTS ==========
+        if "drafts" in pipelines:
+            if draft_data is None:
+                raise ValueError("Draft data is required for drafts pipeline")
+
+            try:
+                logger.info(f"[{db_name}] Loading drafts to staging...")
+                with engine.begin() as conn:
+                    draft_data.to_sql('drafts', conn, schema='staging1', if_exists='replace', index=False)
+                logger.info(f"[{db_name}] ✓ Drafts loaded to staging")
+                summary["drafts"] = len(draft_data)
+
+                logger.info(f"[{db_name}] Running drafts sync procedure...")
+                with engine.begin() as conn:
+                    conn.execute(text("CALL sync_drafts_from_staging()"))
+                logger.info(f"[{db_name}] ✓ Drafts sync completed")
+            except SQLAlchemyError:
+                logger.exception(f"[{db_name}] Failed loading drafts staging; transaction rolled back")
+                raise
+        else:
+            logger.info(f"[{db_name}] Skipping drafts sync")
+
+        # ========== PIPELINE 5: GAMES ==========
         if "games" in pipelines:
             try:
                 logger.info(f"[{db_name}] Loading games to staging...")
@@ -304,7 +329,7 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         else:
             logger.info(f"[{db_name}] Skipping games sync")
 
-        # ========== PIPELINE 4: GAMECENTER PLAY-BY-PLAY ==========
+        # ========== PIPELINE 6: GAMECENTER PLAY-BY-PLAY ==========
         if "gamecenter" in pipelines:
             try:
                 logger.info(f"[{db_name}] Fetching and staging gamecenter play-by-play...")
@@ -372,7 +397,7 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
         else:
             logger.info(f"[{db_name}] Skipping gamecenter play-by-play")
 
-        # ========== PIPELINE 5: SCHEDULE/NOW DAILY GAME ROSTERS ==========
+        # ========== PIPELINE 7: SCHEDULE/NOW DAILY GAME ROSTERS ==========
         if "daily_rosters" in pipelines:
             if daily_data is None:
                 raise ValueError("Daily schedule/roster data is required for daily_rosters pipeline")
@@ -501,6 +526,7 @@ async def main():
     roster_data = None
     season_data = None
     team_data = {}
+    draft_data = None
     daily_data = None
 
     if "rosters" in pipelines or "players" in pipelines:
@@ -536,6 +562,13 @@ async def main():
         })
     else:
         logger.info("Skipping teams/franchises/team summaries source scrape")
+
+    if "drafts" in pipelines:
+        logger.info("Scraping drafts from NHL API...")
+        draft_data = await scraper.scrape_all_drafts_async()
+        logger.info(f"✓ Scraped {len(draft_data)} draft pick records")
+    else:
+        logger.info("Skipping drafts source scrape")
 
     if "games" in pipelines or ("gamecenter" in pipelines and not gamecenter_game_ids):
         logger.info("Scraping games from NHL API...")
@@ -589,6 +622,7 @@ async def main():
                 roster_data,
                 season_data,
                 team_data,
+                draft_data,
                 daily_data,
                 pipelines,
                 db_config["name"],
