@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from nhl_scraper import NHLScraper
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from dotenv import load_dotenv
 import pandas as pd
 
@@ -209,8 +209,22 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
                     logger.info(f"[{db_name}]   - Syncing season goalies...")
                     conn.execute(text("CALL sync_season_goalies_from_staging()"))
 
-                    logger.info(f"[{db_name}]   - Syncing awards...")
-                    conn.execute(text("CALL sync_awards_from_staging()"))
+                logger.info(f"[{db_name}]   - Syncing awards...")
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("CALL sync_awards_from_staging()"))
+                except ProgrammingError as exc:
+                    error_message = str(exc).lower()
+                    missing_awards_sync_proc = (
+                        "sync_awards_from_staging" in error_message and "does not exist" in error_message
+                    )
+                    if missing_awards_sync_proc:
+                        logger.warning(
+                            f"[{db_name}] sync_awards_from_staging() not found; "
+                            "skipping awards sync for this database"
+                        )
+                    else:
+                        raise
                 logger.info(f"[{db_name}] ✓ All player sync procedures completed")
             else:
                 logger.info(f"[{db_name}] No roster player ids found; skipping detailed player scrape")
