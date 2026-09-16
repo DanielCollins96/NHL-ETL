@@ -214,9 +214,10 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
                     with engine.begin() as conn:
                         conn.execute(text("CALL sync_awards_from_staging()"))
                 except ProgrammingError as exc:
-                    error_message = str(exc).lower()
+                    sqlstate = getattr(getattr(exc, "orig", None), "pgcode", None)
+                    failed_statement = (exc.statement or "").lower()
                     missing_awards_sync_proc = (
-                        "sync_awards_from_staging" in error_message and "does not exist" in error_message
+                        sqlstate == "42883" and "sync_awards_from_staging" in failed_statement
                     )
                     if missing_awards_sync_proc:
                         logger.warning(
