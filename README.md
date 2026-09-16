@@ -55,5 +55,6 @@ Common environment variables:
 READ_MODEL_S3_BUCKET=your-bucket
 READ_MODEL_S3_PREFIX=optional/prefix
 CLOUDFRONT_DISTRIBUTION_ID=optional-distribution-id
+# none, or wildcard for a single /* invalidation. Per-object invalidation is not used.
 CLOUDFRONT_INVALIDATION_MODE=none
 ```

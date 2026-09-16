@@ -13,7 +13,9 @@ Environment:
   READ_MODEL_INCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
   READ_MODEL_EXCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
   CLOUDFRONT_DISTRIBUTION_ID             Optional distribution to invalidate.
-  CLOUDFRONT_INVALIDATION_MODE           none, wildcard, or changed. Defaults to none.
+  CLOUDFRONT_INVALIDATION_MODE           none or wildcard. Defaults to none.
+                                         wildcard submits a single /* path. Per-object
+                                         invalidation is not supported.
 
 Dependencies:
   pip install boto3 sqlalchemy psycopg2-binary
@@ -193,33 +195,31 @@ def iter_read_model_rows(engine, include_prefixes, exclude_prefixes):
             yield row["s3_key"], row["payload"]
 
 
-def invalidate_cloudfront(distribution_id, keys, mode):
-    if not distribution_id or mode == "none":
+def invalidate_cloudfront(distribution_id, mode):
+    if not distribution_id or mode in {"", "none"}:
         return
 
-    cloudfront = boto3.client("cloudfront", config=S3_CONFIG)
-
-    if mode == "wildcard":
-        paths = ["/*"]
-    elif mode == "changed":
-        paths = [f"/{key}" for key in keys]
-    else:
-        raise ValueError("CLOUDFRONT_INVALIDATION_MODE must be none, wildcard, or changed")
-
-    batch_size = 1000
-    for index in range(0, len(paths), batch_size):
-        batch = paths[index:index + batch_size]
-        logger.info("Creating CloudFront invalidation for %s path(s)", len(batch))
-        cloudfront.create_invalidation(
-            DistributionId=distribution_id,
-            InvalidationBatch={
-                "Paths": {
-                    "Quantity": len(batch),
-                    "Items": batch,
-                },
-                "CallerReference": f"read-models-{int(time.time())}-{index}",
-            },
+    if mode == "changed":
+        logger.warning(
+            "CLOUDFRONT_INVALIDATION_MODE=changed is disabled to avoid per-object billing; using wildcard /* instead"
         )
+        mode = "wildcard"
+
+    if mode != "wildcard":
+        raise ValueError("CLOUDFRONT_INVALIDATION_MODE must be none or wildcard")
+
+    cloudfront = boto3.client("cloudfront", config=S3_CONFIG)
+    logger.info("Creating CloudFront invalidation for 1 path: /*")
+    cloudfront.create_invalidation(
+        DistributionId=distribution_id,
+        InvalidationBatch={
+            "Paths": {
+                "Quantity": 1,
+                "Items": ["/*"],
+            },
+            "CallerReference": f"read-models-{int(time.time())}",
+        },
+    )
 
 
 def publish_read_models_to_s3(engine, db_name="primary"):
@@ -320,7 +320,6 @@ def publish_read_models_to_s3(engine, db_name="primary"):
     if not dry_run:
         invalidate_cloudfront(
             os.getenv("CLOUDFRONT_DISTRIBUTION_ID"),
-            uploaded_keys,
             os.getenv("CLOUDFRONT_INVALIDATION_MODE", "none").strip().lower(),
         )
 
