@@ -217,7 +217,7 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
                     sqlstate = getattr(getattr(exc, "orig", None), "pgcode", None)
                     failed_statement = (exc.statement or "").lower()
                     missing_awards_sync_proc = (
-                        sqlstate == "42883" and "sync_awards_from_staging" in failed_statement
+                        sqlstate == "42883" and "sync_awards_from_staging()" in failed_statement
                     )
                     if missing_awards_sync_proc:
                         logger.warning(
