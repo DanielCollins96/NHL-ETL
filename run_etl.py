@@ -239,24 +239,38 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
             summary["season_goalies"] = len(goalies_df)
             logger.info(f"[{db_name}] Using {len(skaters_df)} skater records and {len(goalies_df)} goalie records from scraper")
 
-            logger.info(f"[{db_name}] Loading season stats to staging tables...")
-            try:
+            if skaters_df.empty and goalies_df.empty:
+                logger.info(
+                    f"[{db_name}] Current-season club-stats are empty; "
+                    "skipping skater/goalie staging and sync"
+                )
+            else:
+                logger.info(f"[{db_name}] Loading season stats to staging tables...")
+                try:
+                    with engine.begin() as conn:
+                        if not skaters_df.empty:
+                            skaters_df.to_sql('skaters', conn, if_exists='replace', index=False, schema='staging1')
+                        if not goalies_df.empty:
+                            goalies_df.to_sql('goalies', conn, if_exists='replace', index=False, schema='staging1')
+                except SQLAlchemyError:
+                    logger.exception(f"[{db_name}] Failed loading staging1 skaters/goalies; transaction rolled back")
+                    raise
+                logger.info(f"[{db_name}] ✓ Skaters and goalies data loaded to staging")
+
+                logger.info(f"[{db_name}] Running season stats sync procedures...")
                 with engine.begin() as conn:
-                    skaters_df.to_sql('skaters', conn, if_exists='replace', index=False, schema='staging1')
-                    goalies_df.to_sql('goalies', conn, if_exists='replace', index=False, schema='staging1')
-            except SQLAlchemyError:
-                logger.exception(f"[{db_name}] Failed loading staging1 skaters/goalies; transaction rolled back")
-                raise
-            logger.info(f"[{db_name}] ✓ Skaters and goalies data loaded to staging")
+                    if not skaters_df.empty:
+                        logger.info(f"[{db_name}]   - Syncing skaters from staging...")
+                        conn.execute(text("CALL sync_skaters_from_staging()"))
+                    else:
+                        logger.info(f"[{db_name}]   - Skipping skater sync; no staging rows")
 
-            logger.info(f"[{db_name}] Running season stats sync procedures...")
-            with engine.begin() as conn:
-                logger.info(f"[{db_name}]   - Syncing skaters from staging...")
-                conn.execute(text("CALL sync_skaters_from_staging()"))
-
-                logger.info(f"[{db_name}]   - Syncing goalies from staging...")
-                conn.execute(text("CALL sync_goalies_from_staging()"))
-            logger.info(f"[{db_name}] ✓ Season stats sync completed")
+                    if not goalies_df.empty:
+                        logger.info(f"[{db_name}]   - Syncing goalies from staging...")
+                        conn.execute(text("CALL sync_goalies_from_staging()"))
+                    else:
+                        logger.info(f"[{db_name}]   - Skipping goalie sync; no staging rows")
+                logger.info(f"[{db_name}] ✓ Season stats sync completed")
         else:
             logger.info(f"[{db_name}] Skipping current season skater/goalie stats")
         
