@@ -60,6 +60,7 @@ jobs:
         env:
           DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
           DB_CONNECTION_2: ${{ secrets.DB_CONNECTION_2 }}
+          ETL_PIPELINES: rosters,players,season_stats,teams,games
 
       - name: Publish read models to S3
         run: python publish_read_models_to_s3.py
