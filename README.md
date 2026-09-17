@@ -36,7 +36,20 @@ The ETL will run sequentially against all configured databases. The primary data
 
 ## Publishing Read Models
 
-After the database sync and read-model SQL views have been refreshed, publish static API payloads to S3 with:
+The GitHub Actions workflow runs `publish_read_models_to_s3.py` after a successful database sync, while the runner IP is still allowed through RDS. It publishes from the primary database (`DB_CONNECTION`) only, and only the groups that change on a normal roster/stats/games run: `games,players,teams,seasons,indexes`. Drafts and contracts are skipped.
+
+Required GitHub Actions config:
+
+```
+READ_MODEL_S3_BUCKET
+READ_MODEL_S3_PREFIX                 # optional, e.g. hockey-read-models
+CLOUDFRONT_DISTRIBUTION_ID           # optional
+CLOUDFRONT_INVALIDATION_MODE         # optional; none or wildcard
+```
+
+Those can live in Actions secrets or variables. The AWS OIDC role already used by this workflow also needs S3 put access on the read-model bucket.
+
+To publish locally after the database sync and read-model SQL views have been refreshed:
 
 ```
 READ_MODEL_EXPORT_GROUPS=contracts python publish_read_models_to_s3.py

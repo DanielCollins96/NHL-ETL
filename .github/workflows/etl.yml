@@ -60,6 +60,17 @@ jobs:
         env:
           DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
           DB_CONNECTION_2: ${{ secrets.DB_CONNECTION_2 }}
+
+      - name: Publish read models to S3
+        run: python publish_read_models_to_s3.py
+        env:
+          DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
+          READ_MODEL_S3_BUCKET: ${{ secrets.READ_MODEL_S3_BUCKET || vars.READ_MODEL_S3_BUCKET }}
+          READ_MODEL_S3_PREFIX: ${{ secrets.READ_MODEL_S3_PREFIX || vars.READ_MODEL_S3_PREFIX }}
+          READ_MODEL_EXPORT_GROUPS: games,players,teams,seasons,indexes
+          READ_MODEL_UPLOAD_WORKERS: ${{ vars.READ_MODEL_UPLOAD_WORKERS || '16' }}
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID || vars.CLOUDFRONT_DISTRIBUTION_ID }}
+          CLOUDFRONT_INVALIDATION_MODE: ${{ vars.CLOUDFRONT_INVALIDATION_MODE || 'none' }}
       
       - name: Remove IP from RDS Security Group
         if: always()  # Runs even if previous steps fail
