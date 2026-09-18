@@ -391,11 +391,13 @@ def publish_read_models_to_s3(engine, db_name="primary"):
         len(skipped_keys),
     )
 
-    if not dry_run:
+    if not dry_run and uploaded_keys:
         invalidate_cloudfront(
             os.getenv("CLOUDFRONT_DISTRIBUTION_ID"),
             os.getenv("CLOUDFRONT_INVALIDATION_MODE", "none").strip().lower(),
         )
+    elif not dry_run:
+        logger.info("[%s] Skipping CloudFront invalidation because no objects were uploaded", db_name)
 
     return len(uploaded_keys)
 

@@ -47,7 +47,10 @@ CLOUDFRONT_DISTRIBUTION_ID           # optional
 CLOUDFRONT_INVALIDATION_MODE         # optional; none or wildcard
 ```
 
-Those can live in Actions secrets or variables. The AWS OIDC role already used by this workflow also needs S3 put access on the read-model bucket.
+Those can live in Actions secrets or variables. The AWS OIDC role already used by this workflow also needs:
+
+- `s3:PutObject` on the read-model bucket objects
+- `s3:ListBucket` on the read-model bucket (used for unchanged-upload ETag checks)
 
 To publish locally after the database sync and read-model SQL views have been refreshed:
 
