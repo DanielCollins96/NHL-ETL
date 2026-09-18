@@ -1,18 +1,10 @@
-# .github/workflows/etl.yml
-name: NHL Daily ETL
+# .github/workflows/weekly-etl.yml
+name: NHL Weekly Full ETL
 
 on:
   schedule:
-    - cron: '0 1,7 * * *'  # Runs at 1+7 AM UTC daily
-  workflow_dispatch:  # Manual trigger from GitHub UI
-    inputs:
-      team_scope:
-        description: Scrape playing-window teams, or every team
-        type: choice
-        options:
-          - playing
-          - all
-        default: playing
+    - cron: '0 8 * * 1'  # Monday 8 AM UTC
+  workflow_dispatch:
 
 permissions:
   id-token: write  # Required for OIDC authentication with AWS
@@ -68,10 +60,8 @@ jobs:
         env:
           DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
           DB_CONNECTION_2: ${{ secrets.DB_CONNECTION_2 }}
-          ETL_PIPELINES: rosters,players,season_stats,games
-          ETL_TEAM_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.team_scope || 'playing' }}
-          SCHEDULE_LOOKBACK_DAYS: '2'
-          SCHEDULE_LOOKAHEAD_DAYS: '1'
+          ETL_PIPELINES: rosters,players,season_stats,teams,games
+          ETL_TEAM_SCOPE: all
 
       - name: Publish read models to S3
         run: python publish_read_models_to_s3.py

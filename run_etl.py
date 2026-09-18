@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_ORDER = ("rosters", "players", "season_stats", "teams", "drafts", "games", "gamecenter", "daily_rosters")
 FULL_PIPELINES = set(PIPELINE_ORDER) - {"gamecenter", "daily_rosters"}
+TEAM_SCOPED_PIPELINES = {"rosters", "players", "season_stats", "games"}
 PIPELINE_ALIASES = {
     "all": FULL_PIPELINES,
     "full": FULL_PIPELINES,
@@ -30,6 +31,7 @@ PIPELINE_ALIASES = {
     "gamecenter_only": {"gamecenter"},
     "today": {"daily_rosters"},
     "schedule_now": {"daily_rosters"},
+    "playing": TEAM_SCOPED_PIPELINES,
 }
 
 
@@ -42,6 +44,18 @@ def parse_positive_int_env(name, default):
     value = int(raw_value)
     if value < 1:
         raise ValueError(f"{name} must be at least 1")
+    return value
+
+
+def parse_non_negative_int_env(name, default):
+    """Parse a non-negative integer environment variable."""
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+
+    value = int(raw_value)
+    if value < 0:
+        raise ValueError(f"{name} must be at least 0")
     return value
 
 
@@ -70,6 +84,38 @@ def parse_etl_pipelines(value):
         raise ValueError("ETL_PIPELINES did not contain any runnable pipelines")
 
     return selected
+
+
+def parse_etl_team_scope(value):
+    """Parse ETL_TEAM_SCOPE into 'all' or 'playing'."""
+    if not value:
+        return "all"
+
+    name = value.strip().lower().replace("-", "_")
+    if name in {"all", "full"}:
+        return "all"
+    if name in {"playing", "playing_window", "daily"}:
+        return "playing"
+    raise ValueError(
+        f"Unknown ETL_TEAM_SCOPE value: {value}. Valid values: all, playing"
+    )
+
+
+def merge_partial_rosters(scraped_rosters, existing_rosters, scraped_teams):
+    """Keep existing active rosters for teams that were not in this scrape.
+
+    sync_rosters_from_staging() deactivates every active row missing from staging,
+    so a playing-team-only scrape must be padded with the other teams' current rows.
+    """
+    if existing_rosters is None or existing_rosters.empty or not scraped_teams:
+        return scraped_rosters
+
+    other_teams = existing_rosters[~existing_rosters["teamAbbreviation"].isin(scraped_teams)]
+    if other_teams.empty:
+        return scraped_rosters
+
+    other_teams = other_teams.reindex(columns=scraped_rosters.columns)
+    return pd.concat([scraped_rosters, other_teams], ignore_index=True)
 
 
 def parse_gamecenter_game_ids(value):
@@ -111,7 +157,18 @@ def sanitize_games_dataframe(games_df):
     return games_df, sanitized_columns
 
 
-async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, draft_data, daily_data, pipelines, db_name="primary"):
+async def run_etl_for_db(
+    engine,
+    scraper,
+    roster_data,
+    season_data,
+    team_data,
+    draft_data,
+    daily_data,
+    pipelines,
+    db_name="primary",
+    roster_team_codes=None,
+):
     """Run the NHL roster ETL process for a single database."""
     start_time = datetime.now()
     ordered_pipelines = [name for name in PIPELINE_ORDER if name in pipelines]
@@ -154,11 +211,18 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
                 active_rosters = pd.read_sql('SELECT * FROM newapi.rosters_active', conn)
             logger.info(f"[{db_name}] ✓ Loaded {len(active_rosters)} existing active roster records")
 
-            new_ids = current_data['playerId'].dropna().astype(int).unique().tolist()
+            scraped_ids = current_data['playerId'].dropna().astype(int).unique().tolist() if not current_data.empty else []
             existing_ids = active_rosters['playerId'].dropna().astype(int).unique().tolist()
 
-            new_players = current_data[~current_data['playerId'].isin(existing_ids)]
-            missing_players = active_rosters[~active_rosters['playerId'].isin(new_ids)]
+            new_players = current_data[~current_data['playerId'].isin(existing_ids)] if not current_data.empty else current_data
+            compare_rosters = active_rosters
+            if roster_team_codes:
+                compare_rosters = active_rosters[active_rosters['teamAbbreviation'].isin(roster_team_codes)]
+                logger.info(
+                    f"[{db_name}] Restricting roster send-down check to {len(roster_team_codes)} scraped teams"
+                )
+            missing_players = compare_rosters[~compare_rosters['playerId'].isin(scraped_ids)]
+            new_ids = scraped_ids
             summary["new_call_ups"] = len(new_players)
             summary["send_downs"] = len(missing_players)
 
@@ -169,26 +233,36 @@ async def run_etl_for_db(engine, scraper, roster_data, season_data, team_data, d
             if len(missing_players) > 0:
                 logger.info(f"[{db_name}] Missing players: {missing_players['playerId'].tolist()}")
 
-        if "rosters" in pipelines:
-            logger.info(f"[{db_name}] Loading current roster data to staging table...")
-            try:
-                with engine.begin() as conn:
-                    current_data.to_sql(
-                        'current_rosters',
-                        conn,
-                        schema='staging1',
-                        if_exists='replace',
-                        index=False
-                    )
-            except SQLAlchemyError:
-                logger.exception(f"[{db_name}] Failed loading staging1.current_rosters; transaction rolled back")
-                raise
-            logger.info(f"[{db_name}] ✓ Data loaded to staging1.current_rosters")
+            if roster_team_codes and not current_data.empty:
+                current_data = merge_partial_rosters(current_data, active_rosters, roster_team_codes)
+                logger.info(
+                    f"[{db_name}] Padded staging rosters with existing rows for non-playing teams "
+                    f"({len(current_data)} total rows)"
+                )
 
-            logger.info(f"[{db_name}] Running sync_rosters_from_staging procedure...")
-            with engine.begin() as conn:
-                conn.execute(text("CALL sync_rosters_from_staging()"))
-            logger.info(f"[{db_name}] ✓ Roster sync completed")
+        if "rosters" in pipelines:
+            if current_data is None or current_data.empty:
+                logger.info(f"[{db_name}] No roster rows to stage; skipping roster staging/sync")
+            else:
+                logger.info(f"[{db_name}] Loading current roster data to staging table...")
+                try:
+                    with engine.begin() as conn:
+                        current_data.to_sql(
+                            'current_rosters',
+                            conn,
+                            schema='staging1',
+                            if_exists='replace',
+                            index=False
+                        )
+                except SQLAlchemyError:
+                    logger.exception(f"[{db_name}] Failed loading staging1.current_rosters; transaction rolled back")
+                    raise
+                logger.info(f"[{db_name}] ✓ Data loaded to staging1.current_rosters")
+
+                logger.info(f"[{db_name}] Running sync_rosters_from_staging procedure...")
+                with engine.begin() as conn:
+                    conn.execute(text("CALL sync_rosters_from_staging()"))
+                logger.info(f"[{db_name}] ✓ Roster sync completed")
         else:
             logger.info(f"[{db_name}] Skipping roster staging/sync")
 
@@ -520,9 +594,13 @@ async def main():
     connection_string = os.getenv('DB_CONNECTION')
     connection_string_2 = os.getenv('DB_CONNECTION_2')
     pipelines = parse_etl_pipelines(os.getenv("ETL_PIPELINES", "all"))
+    team_scope = parse_etl_team_scope(os.getenv("ETL_TEAM_SCOPE", "all"))
     ordered_pipelines = [name for name in PIPELINE_ORDER if name in pipelines]
     gamecenter_game_ids = parse_gamecenter_game_ids(os.getenv("GAMECENTER_GAME_IDS"))
-    schedule_lookback_days = parse_positive_int_env("SCHEDULE_LOOKBACK_DAYS", 1)
+    default_lookback_days = 2 if team_scope == "playing" else 1
+    schedule_lookback_days = parse_positive_int_env("SCHEDULE_LOOKBACK_DAYS", default_lookback_days)
+    default_lookahead_days = 1 if team_scope == "playing" else 0
+    schedule_lookahead_days = parse_non_negative_int_env("SCHEDULE_LOOKAHEAD_DAYS", default_lookahead_days)
     schedule_end_date = os.getenv("SCHEDULE_END_DATE") or None
     
     if not connection_string:
@@ -538,11 +616,13 @@ async def main():
     
     logger.info(f"Found {len(db_configs)} database connection(s) to process")
     logger.info(f"Enabled ETL pipelines: {ordered_pipelines}")
+    logger.info(f"ETL team scope: {team_scope}")
     if gamecenter_game_ids:
         logger.info(f"Restricting gamecenter to {len(gamecenter_game_ids)} GAMECENTER_GAME_IDS")
-    if "daily_rosters" in pipelines:
+    if "daily_rosters" in pipelines or team_scope == "playing":
         logger.info(
-            f"Daily roster schedule window: last {schedule_lookback_days} day(s)"
+            f"Schedule window: last {schedule_lookback_days} day(s)"
+            f"{f' plus next {schedule_lookahead_days} day(s)' if schedule_lookahead_days else ''}"
             f"{f' ending {schedule_end_date}' if schedule_end_date else ''}"
         )
     
@@ -553,17 +633,50 @@ async def main():
     team_data = {}
     draft_data = None
     daily_data = None
+    playing_teams = None
+    schedule_dates = None
+
+    if team_scope == "playing":
+        schedule_dates = scraper.get_schedule_window_dates(
+            days=schedule_lookback_days,
+            end_date=schedule_end_date,
+            lookahead_days=schedule_lookahead_days,
+        )
+        playing_teams = [
+            team for team in scraper.get_teams_for_dates(schedule_dates)
+            if team in scraper.active_team_codes
+        ]
+        logger.info(
+            f"Teams playing in schedule window {schedule_dates}: "
+            f"{playing_teams or 'none'}"
+        )
+        if not playing_teams:
+            skipped = sorted(pipelines & TEAM_SCOPED_PIPELINES)
+            pipelines = pipelines - TEAM_SCOPED_PIPELINES
+            ordered_pipelines = [name for name in PIPELINE_ORDER if name in pipelines]
+            if skipped:
+                logger.info(
+                    f"No teams playing in window; skipping team-scoped pipelines: {skipped}"
+                )
 
     if "rosters" in pipelines or "players" in pipelines:
-        logger.info("Scraping roster data from NHL API...")
-        roster_data = await scraper.scrape_all_rosters()
+        if playing_teams is not None:
+            logger.info(f"Scraping roster data for {len(playing_teams)} playing teams...")
+            roster_data = await scraper.scrape_all_rosters(team_codes=playing_teams)
+        else:
+            logger.info("Scraping roster data from NHL API...")
+            roster_data = await scraper.scrape_all_rosters()
         logger.info(f"✓ Scraped {len(roster_data)} roster records")
     else:
         logger.info("Skipping roster source scrape")
 
     if "season_stats" in pipelines:
-        logger.info("Scraping current season stats from NHL API...")
-        season_data = await scraper.scrape_current_season()
+        if playing_teams is not None:
+            logger.info(f"Scraping current season stats for {len(playing_teams)} playing teams...")
+            season_data = await scraper.scrape_current_season(team_codes=playing_teams)
+        else:
+            logger.info("Scraping current season stats from NHL API...")
+            season_data = await scraper.scrape_current_season()
         logger.info(f"✓ Scraped {len(season_data['skaters'])} skaters and {len(season_data['goalies'])} goalies")
     else:
         logger.info("Skipping current season source scrape")
@@ -596,8 +709,12 @@ async def main():
         logger.info("Skipping drafts source scrape")
 
     if "games" in pipelines or ("gamecenter" in pipelines and not gamecenter_game_ids):
-        logger.info("Scraping games from NHL API...")
-        games_data = scraper.scrape_all_games_dataframes()
+        if schedule_dates is not None:
+            logger.info(f"Scraping games for schedule dates {schedule_dates}...")
+            games_data = scraper.scrape_all_games_dataframes(dates=schedule_dates)
+        else:
+            logger.info("Scraping games from NHL API...")
+            games_data = scraper.scrape_all_games_dataframes()
         team_data.update(games_data)
         games = games_data["games"]
         logger.info(f"✓ Scraped {len(games)} games")
@@ -610,11 +727,12 @@ async def main():
         team_data["gamecenter_game_ids"] = gamecenter_game_ids
 
     if "daily_rosters" in pipelines:
-        if schedule_lookback_days > 1 or schedule_end_date:
+        if schedule_lookback_days > 1 or schedule_lookahead_days or schedule_end_date:
             logger.info("Scraping recent schedule games from NHL API...")
             daily_data = await scraper.scrape_recent_schedule_game_rosters(
                 days=schedule_lookback_days,
                 end_date=schedule_end_date,
+                lookahead_days=schedule_lookahead_days,
             )
             schedule_label = f"last {schedule_lookback_days} day(s)"
         else:
@@ -651,6 +769,7 @@ async def main():
                 daily_data,
                 pipelines,
                 db_config["name"],
+                roster_team_codes=playing_teams,
             )
             succeeded_dbs.append(db_config["name"])
         except Exception as e:
