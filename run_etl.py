@@ -222,7 +222,13 @@ async def run_etl_for_db(
                     f"[{db_name}] Restricting roster send-down check to {len(roster_team_codes)} scraped teams"
                 )
             missing_players = compare_rosters[~compare_rosters['playerId'].isin(scraped_ids)]
-            new_ids = scraped_ids
+            # Landing pages are for players missing from the DB. Current-season
+            # stats come from season_stats (club-stats), not a full roster re-scrape.
+            new_ids = (
+                new_players["playerId"].dropna().astype(int).unique().tolist()
+                if not new_players.empty
+                else []
+            )
             summary["new_call_ups"] = len(new_players)
             summary["send_downs"] = len(missing_players)
 
@@ -268,7 +274,7 @@ async def run_etl_for_db(
 
         if "players" in pipelines:
             if len(new_ids) > 0:
-                logger.info(f"[{db_name}] Scraping detailed data for {len(new_ids)} players...")
+                logger.info(f"[{db_name}] Scraping landing pages for {len(new_ids)} call-up players...")
                 await scraper.scrape_all_players(new_ids, engine)
                 logger.info(f"[{db_name}] ✓ Player data scraped and loaded to staging")
 
@@ -298,7 +304,7 @@ async def run_etl_for_db(
                         raise
                 logger.info(f"[{db_name}] ✓ All player sync procedures completed")
             else:
-                logger.info(f"[{db_name}] No roster player ids found; skipping detailed player scrape")
+                logger.info(f"[{db_name}] No new call-ups; skipping player landing scrape")
         else:
             logger.info(f"[{db_name}] Skipping player detail/awards sync")
         
