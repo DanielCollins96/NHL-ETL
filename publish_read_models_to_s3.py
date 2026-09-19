@@ -8,6 +8,8 @@ Environment:
   READ_MODEL_S3_CACHE_CONTROL            Optional Cache-Control header.
   READ_MODEL_DRY_RUN                     true/false. Defaults to false.
   READ_MODEL_UPLOAD_WORKERS              Concurrent S3 uploads. Defaults to 8.
+  READ_MODEL_SKIP_UNCHANGED              Skip PUT when the S3 ETag matches the payload MD5.
+                                         Defaults to true.
   READ_MODEL_MAX_OBJECTS                 Optional limit for testing.
   READ_MODEL_EXPORT_GROUPS               Optional comma-separated groups: games, players, teams, seasons, drafts, contracts, indexes.
   READ_MODEL_INCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
@@ -21,6 +23,7 @@ Dependencies:
   pip install boto3 sqlalchemy psycopg2-binary
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -157,6 +160,44 @@ def serialize_payload(payload):
     ).encode("utf-8")
 
 
+def payload_etag(body):
+    """S3 ETag for a single-part PutObject is the MD5 hex digest."""
+    return hashlib.md5(body, usedforsecurity=False).hexdigest()
+
+
+def s3_list_prefixes(bucket_prefix, include_prefixes):
+    base = (bucket_prefix or "").strip("/")
+    if not include_prefixes:
+        return [f"{base}/" if base else ""]
+
+    prefixes = []
+    for include in include_prefixes:
+        include = include.strip().lstrip("/")
+        if not include:
+            continue
+        prefixes.append(f"{base}/{include}" if base else include)
+    return prefixes
+
+
+def list_existing_etags(s3, bucket, prefixes):
+    """Map existing object keys to unquoted ETags via ListBucket."""
+    etags = {}
+    paginator = s3.get_paginator("list_objects_v2")
+    for prefix in prefixes:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents") or []:
+                etag = (obj.get("ETag") or "").strip('"')
+                if etag:
+                    etags[obj["Key"]] = etag
+    return etags
+
+
+def is_unchanged_object(existing_etag, body):
+    if not existing_etag or "-" in existing_etag:
+        return False
+    return existing_etag == payload_etag(body)
+
+
 def build_s3_key(key, prefix):
     clean_key = str(key).lstrip("/")
     clean_prefix = (prefix or "").strip("/")
@@ -227,6 +268,7 @@ def publish_read_models_to_s3(engine, db_name="primary"):
     prefix = os.getenv("READ_MODEL_S3_PREFIX", "")
     cache_control = os.getenv("READ_MODEL_S3_CACHE_CONTROL", DEFAULT_CACHE_CONTROL)
     dry_run = env_bool("READ_MODEL_DRY_RUN", default=False)
+    skip_unchanged = env_bool("READ_MODEL_SKIP_UNCHANGED", default=True)
     workers = env_int("READ_MODEL_UPLOAD_WORKERS", default=8)
     max_objects = env_int("READ_MODEL_MAX_OBJECTS")
     export_groups = os.getenv("READ_MODEL_EXPORT_GROUPS", "")
@@ -240,19 +282,35 @@ def publish_read_models_to_s3(engine, db_name="primary"):
     if not bucket and not dry_run:
         raise ValueError("READ_MODEL_S3_BUCKET must be set unless READ_MODEL_DRY_RUN=true")
 
-    s3 = None if dry_run else boto3.client("s3", config=S3_CONFIG)
+    s3 = boto3.client("s3", config=S3_CONFIG) if bucket else None
     uploaded_keys = []
+    skipped_keys = []
     total_bytes = 0
+    existing_etags = {}
 
     logger.info(
-        "[%s] Publishing read models from readmodel.s3_objects (dry_run=%s, workers=%s, groups=%s, include=%s, exclude=%s)",
+        "[%s] Publishing read models from readmodel.s3_objects (dry_run=%s, skip_unchanged=%s, workers=%s, groups=%s, include=%s, exclude=%s)",
         db_name,
         dry_run,
+        skip_unchanged,
         workers,
         export_groups or None,
         include_prefixes,
         exclude_prefixes,
     )
+
+    if s3 and skip_unchanged:
+        list_prefixes = s3_list_prefixes(prefix, include_prefixes)
+        try:
+            existing_etags = list_existing_etags(s3, bucket, list_prefixes)
+            logger.info("[%s] Loaded %s existing S3 ETags for unchanged checks", db_name, len(existing_etags))
+        except Exception:
+            logger.exception(
+                "[%s] Failed listing existing S3 objects; uploading all selected keys",
+                db_name,
+            )
+            existing_etags = {}
+            skip_unchanged = False
 
     def upload_one(upload_key, upload_body):
         s3.put_object(
@@ -280,14 +338,23 @@ def publish_read_models_to_s3(engine, db_name="primary"):
 
             key = build_s3_key(s3_key, prefix)
             body = serialize_payload(payload)
+
+            if skip_unchanged and is_unchanged_object(existing_etags.get(key), body):
+                skipped_keys.append(key)
+                if len(skipped_keys) <= 10:
+                    logger.info("[%s] SKIP unchanged %s", db_name, key)
+                elif len(skipped_keys) % 500 == 0:
+                    logger.info("[%s] Skipped %s unchanged read model objects", db_name, len(skipped_keys))
+                continue
+
             total_bytes += len(body)
 
             if dry_run:
-                if seen <= 10:
+                if len(uploaded_keys) < 10:
                     logger.info("[%s] DRY RUN %s bytes -> s3://%s/%s", db_name, len(body), bucket or "<bucket>", key)
                 uploaded_keys.append(key)
             else:
-                if seen <= 10:
+                if len(uploaded_keys) + len(pending) < 10:
                     logger.info("[%s] QUEUE %s bytes -> s3://%s/%s", db_name, len(body), bucket, key)
 
                 while len(pending) >= workers:
@@ -298,7 +365,13 @@ def publish_read_models_to_s3(engine, db_name="primary"):
                 pending.add(executor.submit(upload_one, key, body))
 
             if seen % 500 == 0:
-                logger.info("[%s] Queued %s read model objects", db_name, seen)
+                logger.info(
+                    "[%s] Processed %s read model objects (%s queued, %s unchanged)",
+                    db_name,
+                    seen,
+                    len(uploaded_keys) + len(pending),
+                    len(skipped_keys),
+                )
 
         if not dry_run and pending:
             logger.info("[%s] Waiting for %s pending S3 uploads...", db_name, len(pending))
@@ -310,18 +383,21 @@ def publish_read_models_to_s3(engine, db_name="primary"):
             executor.shutdown(wait=True)
 
     logger.info(
-        "[%s] %s %s read model objects (%0.2f MB)",
+        "[%s] %s %s read model objects (%0.2f MB); skipped %s unchanged",
         db_name,
         "Would publish" if dry_run else "Published",
         len(uploaded_keys),
         total_bytes / 1024 / 1024,
+        len(skipped_keys),
     )
 
-    if not dry_run:
+    if not dry_run and uploaded_keys:
         invalidate_cloudfront(
             os.getenv("CLOUDFRONT_DISTRIBUTION_ID"),
             os.getenv("CLOUDFRONT_INVALIDATION_MODE", "none").strip().lower(),
         )
+    elif not dry_run:
+        logger.info("[%s] Skipping CloudFront invalidation because no objects were uploaded", db_name)
 
     return len(uploaded_keys)
 
