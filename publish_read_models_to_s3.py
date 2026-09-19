@@ -11,8 +11,13 @@ Environment:
   READ_MODEL_SKIP_UNCHANGED              Skip PUT when the S3 ETag matches the payload MD5.
                                          Defaults to true.
   READ_MODEL_MAX_OBJECTS                 Optional limit for testing.
-  READ_MODEL_EXPORT_GROUPS               Optional comma-separated groups: games, players, teams, seasons, drafts, contracts, indexes.
+  READ_MODEL_EXPORT_GROUPS               Optional comma-separated groups: playing, games, players, teams, seasons, drafts, contracts, indexes.
+                                         playing publishes the schedule-window games, those teams'
+                                         rostered players, the current season, and related indexes.
   READ_MODEL_INCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
+  SCHEDULE_LOOKBACK_DAYS                 Used by the playing group. Defaults to 2.
+  SCHEDULE_LOOKAHEAD_DAYS                Used by the playing group. Defaults to 1.
+  SCHEDULE_END_DATE                      Optional YYYY-MM-DD end of the playing window.
   READ_MODEL_EXCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
   CLOUDFRONT_DISTRIBUTION_ID             Optional distribution to invalidate.
   CLOUDFRONT_INVALIDATION_MODE           none or wildcard. Defaults to none.
@@ -29,9 +34,10 @@ import logging
 import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import boto3
 from botocore.config import Config
@@ -52,6 +58,16 @@ DEFAULT_SQL = """
     SELECT s3_key, payload
     FROM readmodel.s3_objects
 """
+NHL_SCHEDULE_TZ = ZoneInfo("America/New_York")
+PLAYING_EXPORT_GROUP = "playing"
+PLAYING_INDEX_KEYS = [
+    "indexes/game-date-range.json",
+    "indexes/player-ids.json",
+    "indexes/player-search/",
+    "indexes/team-ids.json",
+    "indexes/team-rosters.json",
+    "indexes/teams.json",
+]
 EXPORT_GROUP_PREFIXES = {
     "players": ["players/", "indexes/player-ids.json", "indexes/player-search/"],
     "teams": ["teams/", "indexes/teams.json", "indexes/team-ids.json", "indexes/team-rosters.json"],
@@ -92,28 +108,144 @@ def env_prefixes(name):
 
 
 def export_group_prefixes(value):
+    prefixes, _use_playing = parse_export_groups(value)
+    return prefixes
+
+
+def parse_export_groups(value):
     if not value:
-        return []
+        return [], False
 
     prefixes = []
     unknown = []
     seen = set()
+    use_playing = False
     for raw_group in value.split(","):
         group = raw_group.strip().lower().replace("-", "_")
-        if not group:
+        if not group or group in seen:
+            continue
+        seen.add(group)
+        if group == PLAYING_EXPORT_GROUP:
+            use_playing = True
             continue
         if group not in EXPORT_GROUP_PREFIXES:
             unknown.append(raw_group.strip())
             continue
         for prefix in EXPORT_GROUP_PREFIXES[group]:
-            if prefix not in seen:
+            if prefix not in prefixes:
                 prefixes.append(prefix)
-                seen.add(prefix)
 
     if unknown:
-        valid = sorted(EXPORT_GROUP_PREFIXES)
+        valid = sorted(set(EXPORT_GROUP_PREFIXES) | {PLAYING_EXPORT_GROUP})
         raise ValueError(f"Unknown READ_MODEL_EXPORT_GROUPS value(s): {unknown}. Valid values: {valid}")
 
+    return prefixes, use_playing
+
+
+def nhl_calendar_date(end_date=None):
+    if end_date:
+        return date.fromisoformat(end_date)
+    return datetime.now(NHL_SCHEDULE_TZ).date()
+
+
+def schedule_window_dates(lookback_days=2, lookahead_days=1, end_date=None):
+    """Match NHLScraper.get_schedule_window_dates() in America/New_York."""
+    if lookback_days < 1:
+        raise ValueError("SCHEDULE_LOOKBACK_DAYS must be at least 1")
+    if lookahead_days < 0:
+        raise ValueError("SCHEDULE_LOOKAHEAD_DAYS must be at least 0")
+
+    end = nhl_calendar_date(end_date)
+    return [
+        (end - timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(-lookahead_days, lookback_days)
+    ]
+
+
+def nhl_season_id_for_date(value):
+    year = value.year
+    if value.month >= 8:
+        return f"{year}{year + 1}"
+    return f"{year - 1}{year}"
+
+
+def playing_window_prefixes(engine):
+    """S3 keys that a playing-window roster/stats/games run can change."""
+    lookback_days = env_int("SCHEDULE_LOOKBACK_DAYS", default=2)
+    lookahead_days = env_int("SCHEDULE_LOOKAHEAD_DAYS", default=1)
+    end_date = os.getenv("SCHEDULE_END_DATE") or None
+    dates = schedule_window_dates(lookback_days, lookahead_days, end_date)
+    prefixes = [f"games/dates/{window_date}.json" for window_date in dates]
+    prefixes.extend(PLAYING_INDEX_KEYS)
+    prefixes.append(f"seasons/{nhl_season_id_for_date(nhl_calendar_date(end_date))}.json")
+
+    with engine.connect() as conn:
+        current_season = conn.execute(
+            text("SELECT MAX(season) FROM readmodel.available_seasons")
+        ).scalar()
+        if current_season:
+            prefixes.append(f"seasons/{current_season}.json")
+
+        games = conn.execute(
+            text(
+                """
+                SELECT
+                    g.id,
+                    g."awayTeam_dbId" AS away_id,
+                    g."homeTeam_dbId" AS home_id,
+                    g."awayTeam_abbrev" AS away_abbrev,
+                    g."homeTeam_abbrev" AS home_abbrev
+                FROM readmodel.games g
+                WHERE g."gameDate" = ANY(CAST(:dates AS date[]))
+                """
+            ),
+            {"dates": dates},
+        ).mappings()
+
+        team_ids = set()
+        abbrevs = set()
+        game_count = 0
+        for game in games:
+            game_count += 1
+            prefixes.append(f"games/{game['id']}.json")
+            if game["away_id"]:
+                team_ids.add(int(game["away_id"]))
+            if game["home_id"]:
+                team_ids.add(int(game["home_id"]))
+            if game["away_abbrev"]:
+                abbrevs.add(game["away_abbrev"])
+            if game["home_abbrev"]:
+                abbrevs.add(game["home_abbrev"])
+
+        for team_id in sorted(team_ids):
+            prefixes.append(f"teams/{team_id}.json")
+
+        player_ids = []
+        if abbrevs:
+            player_ids = [
+                row[0]
+                for row in conn.execute(
+                    text(
+                        """
+                        SELECT DISTINCT r."playerId"
+                        FROM readmodel.active_rosters r
+                        WHERE r."teamAbbreviation" = ANY(:abbrevs)
+                          AND r."playerId" IS NOT NULL
+                        ORDER BY r."playerId"
+                        """
+                    ),
+                    {"abbrevs": sorted(abbrevs)},
+                )
+            ]
+            prefixes.extend(f"players/{player_id}.json" for player_id in player_ids)
+
+    logger.info(
+        "Playing-window publish scope dates=%s games=%s teams=%s players=%s",
+        dates,
+        game_count,
+        len(team_ids),
+        len(player_ids),
+    )
     return prefixes
 
 
@@ -171,11 +303,19 @@ def s3_list_prefixes(bucket_prefix, include_prefixes):
         return [f"{base}/" if base else ""]
 
     prefixes = []
+    seen = set()
     for include in include_prefixes:
         include = include.strip().lstrip("/")
         if not include:
             continue
-        prefixes.append(f"{base}/{include}" if base else include)
+        file_name = include.rsplit("/", 1)[-1]
+        if not include.endswith("/") and "." in file_name:
+            parent = include.rsplit("/", 1)[0] if "/" in include else ""
+            include = f"{parent}/" if parent else include
+        listed = f"{base}/{include}" if base else include
+        if listed not in seen:
+            seen.add(listed)
+            prefixes.append(listed)
     return prefixes
 
 
@@ -209,8 +349,19 @@ def build_read_model_sql(include_prefixes, exclude_prefixes):
     params = {}
 
     if include_prefixes:
+        exact_keys = []
+        like_prefixes = []
+        for prefix in include_prefixes:
+            if prefix.endswith("/"):
+                like_prefixes.append(prefix)
+            else:
+                exact_keys.append(prefix)
+
         include_clauses = []
-        for index, prefix in enumerate(include_prefixes):
+        if exact_keys:
+            include_clauses.append("s3_key = ANY(:include_keys)")
+            params["include_keys"] = exact_keys
+        for index, prefix in enumerate(like_prefixes):
             param_name = f"include_prefix_{index}"
             include_clauses.append(f"s3_key LIKE :{param_name}")
             params[param_name] = f"{prefix}%"
@@ -272,11 +423,15 @@ def publish_read_models_to_s3(engine, db_name="primary"):
     workers = env_int("READ_MODEL_UPLOAD_WORKERS", default=8)
     max_objects = env_int("READ_MODEL_MAX_OBJECTS")
     export_groups = os.getenv("READ_MODEL_EXPORT_GROUPS", "")
+    group_prefixes, use_playing = parse_export_groups(export_groups)
     include_prefixes = combine_prefixes(
-        export_group_prefixes(export_groups),
+        group_prefixes,
+        playing_window_prefixes(engine) if use_playing else [],
         env_prefixes("READ_MODEL_INCLUDE_PREFIXES"),
     )
     exclude_prefixes = env_prefixes("READ_MODEL_EXCLUDE_PREFIXES")
+    if use_playing and not include_prefixes:
+        raise ValueError("READ_MODEL_EXPORT_GROUPS=playing produced no S3 keys to publish")
     workers = max(1, workers)
 
     if not bucket and not dry_run:
@@ -288,6 +443,11 @@ def publish_read_models_to_s3(engine, db_name="primary"):
     total_bytes = 0
     existing_etags = {}
 
+    include_log = (
+        include_prefixes
+        if len(include_prefixes) <= 20
+        else f"{len(include_prefixes)} selected keys"
+    )
     logger.info(
         "[%s] Publishing read models from readmodel.s3_objects (dry_run=%s, skip_unchanged=%s, workers=%s, groups=%s, include=%s, exclude=%s)",
         db_name,
@@ -295,7 +455,7 @@ def publish_read_models_to_s3(engine, db_name="primary"):
         skip_unchanged,
         workers,
         export_groups or None,
-        include_prefixes,
+        include_log,
         exclude_prefixes,
     )
 
