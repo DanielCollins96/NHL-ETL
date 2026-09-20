@@ -3,7 +3,12 @@ name: NHL Daily ETL
 
 on:
   schedule:
-    - cron: '0 1,7 * * *'  # Runs at 1+7 AM UTC daily
+    # Always scrape at 1:00 and 7:00 UTC.
+    - cron: '0 1,7 * * *'
+    # Extra look-ins after the evening run. These jobs exit immediately
+    # unless /schedule/now still has LIVE/CRIT games. Do not sleep on a runner.
+    - cron: '15,30,45 1-3 * * *'
+    - cron: '0 2-4 * * *'
   workflow_dispatch:  # Manual trigger from GitHub UI
     inputs:
       team_scope:
@@ -18,52 +23,89 @@ permissions:
   id-token: write  # Required for OIDC authentication with AWS
   contents: read
 
+concurrency:
+  group: nhl-daily-etl
+  cancel-in-progress: false
+
 jobs:
-  run-etl:
+  maybe-run:
     runs-on: ubuntu-latest
-    
+    outputs:
+      run_etl: ${{ steps.decide.outputs.run_etl }}
     steps:
       - name: Checkout ETL repo
         uses: actions/checkout@v4
-      
+
+      - name: Decide whether to scrape
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual run; scraping"
+            echo "run_etl=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event.schedule }}" = "0 1,7 * * *" ]; then
+            echo "Scheduled 1:00/7:00 UTC catch-up; scraping"
+            echo "run_etl=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if python check_live_games.py; then
+            echo "In-progress games; scraping"
+            echo "run_etl=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No in-progress games; skipping ETL"
+            echo "run_etl=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  run-etl:
+    needs: maybe-run
+    if: needs.maybe-run.outputs.run_etl == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout ETL repo
+        uses: actions/checkout@v4
+
       - name: Get Runner IP
         id: ip
         run: echo "ipv4=$(curl -s https://api.ipify.org)" >> $GITHUB_OUTPUT
-      
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-2
-      
+
       - name: Add IP to RDS Security Group
         run: |
           RUNNER_IP="${{ steps.ip.outputs.ipv4 }}"
           SECURITY_GROUP_ID="${{ secrets.RDS_SECURITY_GROUP_ID }}"
-          
+
           echo "Adding IP ${RUNNER_IP}/32 to security group ${SECURITY_GROUP_ID}"
-          
+
           aws ec2 authorize-security-group-ingress \
             --group-id $SECURITY_GROUP_ID \
             --protocol tcp \
             --port 5432 \
             --cidr ${RUNNER_IP}/32 \
             --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=ManagedBy,Value=GitHubActions},{Key=CreatedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)}]" 2>&1 || echo "Rule may already exist"
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: 'requirements.txt'
-      
+
       - name: Install scraper from GitHub
         run: pip install git+https://github.com/DanielCollins96/NHLScraper.git
-      
+
       - name: Install ETL dependencies
         run: pip install -r requirements.txt
-      
-      - name: Run ETL and publish while games are live
+
+      - name: Run ETL
+        run: python run_etl.py
         env:
           DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
           DB_CONNECTION_2: ${{ secrets.DB_CONNECTION_2 }}
@@ -71,50 +113,28 @@ jobs:
           ETL_TEAM_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.team_scope || 'playing' }}
           SCHEDULE_LOOKBACK_DAYS: '1'
           SCHEDULE_LOOKAHEAD_DAYS: '1'
+
+      - name: Publish read models to S3
+        run: python publish_read_models_to_s3.py
+        env:
+          DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
           READ_MODEL_S3_BUCKET: ${{ secrets.READ_MODEL_S3_BUCKET || vars.READ_MODEL_S3_BUCKET }}
           READ_MODEL_S3_PREFIX: ${{ secrets.READ_MODEL_S3_PREFIX || vars.READ_MODEL_S3_PREFIX }}
           READ_MODEL_EXPORT_GROUPS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.team_scope == 'all' && 'games,players,teams,seasons,indexes' || 'playing' }}
+          SCHEDULE_LOOKBACK_DAYS: '1'
+          SCHEDULE_LOOKAHEAD_DAYS: '1'
           READ_MODEL_UPLOAD_WORKERS: ${{ vars.READ_MODEL_UPLOAD_WORKERS || '16' }}
           CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID || vars.CLOUDFRONT_DISTRIBUTION_ID }}
           CLOUDFRONT_INVALIDATION_MODE: ${{ vars.CLOUDFRONT_INVALIDATION_MODE || 'none' }}
-          LIVE_RERUN_ATTEMPTS: ${{ vars.LIVE_RERUN_ATTEMPTS || '6' }}
-          LIVE_RERUN_SLEEP_SECONDS: ${{ vars.LIVE_RERUN_SLEEP_SECONDS || '900' }}
-        run: |
-          set -euo pipefail
-          if [ "${ETL_TEAM_SCOPE}" = "all" ]; then
-            max_attempts=1
-          else
-            max_attempts="${LIVE_RERUN_ATTEMPTS}"
-          fi
-          sleep_secs="${LIVE_RERUN_SLEEP_SECONDS}"
 
-          for attempt in $(seq 1 "${max_attempts}"); do
-            echo "ETL attempt ${attempt}/${max_attempts}"
-            python run_etl.py
-            python publish_read_models_to_s3.py
-
-            if [ "${attempt}" -eq "${max_attempts}" ]; then
-              echo "Reached max ETL attempts"
-              break
-            fi
-
-            if python check_live_games.py; then
-              echo "Games still in progress; sleeping ${sleep_secs}s before another pass"
-              sleep "${sleep_secs}"
-            else
-              echo "No in-progress games; stopping"
-              break
-            fi
-          done
-      
       - name: Remove IP from RDS Security Group
         if: always()  # Runs even if previous steps fail
         run: |
           RUNNER_IP="${{ steps.ip.outputs.ipv4 }}"
           SECURITY_GROUP_ID="${{ secrets.RDS_SECURITY_GROUP_ID }}"
-          
+
           echo "Removing IP ${RUNNER_IP}/32 from security group ${SECURITY_GROUP_ID}"
-          
+
           aws ec2 revoke-security-group-ingress \
             --group-id $SECURITY_GROUP_ID \
             --protocol tcp \

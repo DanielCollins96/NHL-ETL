@@ -40,7 +40,7 @@ The GitHub Actions workflow runs `publish_read_models_to_s3.py` after a successf
 
 The daily job uses `READ_MODEL_EXPORT_GROUPS=playing`: only the schedule-window games (today and tomorrow by default), those teams, their rostered players, the current season page, and the related indexes. Historical players/games/seasons stay untouched. The weekly full scrape still publishes `games,players,teams,seasons,indexes`. Drafts and contracts stay off both jobs.
 
-If `/schedule/now` still has `LIVE` or `CRIT` games after a playing-window run, the daily GitHub job waits 15 minutes and scrapes again, up to 6 passes. A manual run with team scope `all` does not loop.
+If `/schedule/now` still has `LIVE` or `CRIT` games, extra 15-minute cron slots between 1:15 and 4:00 UTC run another scrape. Those extra jobs only ask the NHL API whether games are live; they do not sleep on a runner. The 1:00 and 7:00 UTC runs always scrape.
 
 A manual daily run with team scope `all` also publishes the full catalog.
 
