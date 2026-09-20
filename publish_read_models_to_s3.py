@@ -15,7 +15,7 @@ Environment:
                                          playing publishes the schedule-window games, those teams'
                                          rostered players, the current season, and related indexes.
   READ_MODEL_INCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
-  SCHEDULE_LOOKBACK_DAYS                 Used by the playing group. Defaults to 1.
+  SCHEDULE_LOOKBACK_DAYS                 Used by the playing group. Defaults to 2.
   SCHEDULE_LOOKAHEAD_DAYS                Used by the playing group. Defaults to 1.
   SCHEDULE_END_DATE                      Optional YYYY-MM-DD end of the playing window.
   READ_MODEL_EXCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
@@ -148,7 +148,7 @@ def nhl_calendar_date(end_date=None):
     return datetime.now(NHL_SCHEDULE_TZ).date()
 
 
-def schedule_window_dates(lookback_days=1, lookahead_days=1, end_date=None):
+def schedule_window_dates(lookback_days=2, lookahead_days=1, end_date=None):
     """Match NHLScraper.get_schedule_window_dates() in America/New_York."""
     if lookback_days < 1:
         raise ValueError("SCHEDULE_LOOKBACK_DAYS must be at least 1")
@@ -171,7 +171,7 @@ def nhl_season_id_for_date(value):
 
 def playing_window_prefixes(engine):
     """S3 keys that a playing-window roster/stats/games run can change."""
-    lookback_days = env_int("SCHEDULE_LOOKBACK_DAYS", default=1)
+    lookback_days = env_int("SCHEDULE_LOOKBACK_DAYS", default=2)
     lookahead_days = env_int("SCHEDULE_LOOKAHEAD_DAYS", default=1)
     end_date = os.getenv("SCHEDULE_END_DATE") or None
     dates = schedule_window_dates(lookback_days, lookahead_days, end_date)

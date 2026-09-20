@@ -70,7 +70,7 @@ jobs:
           DB_CONNECTION_2: ${{ secrets.DB_CONNECTION_2 }}
           ETL_PIPELINES: rosters,players,season_stats,games
           ETL_TEAM_SCOPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.team_scope || 'playing' }}
-          SCHEDULE_LOOKBACK_DAYS: '1'
+          SCHEDULE_LOOKBACK_DAYS: '2'
           SCHEDULE_LOOKAHEAD_DAYS: '1'
 
       - name: Publish read models to S3
@@ -80,7 +80,7 @@ jobs:
           READ_MODEL_S3_BUCKET: ${{ secrets.READ_MODEL_S3_BUCKET || vars.READ_MODEL_S3_BUCKET }}
           READ_MODEL_S3_PREFIX: ${{ secrets.READ_MODEL_S3_PREFIX || vars.READ_MODEL_S3_PREFIX }}
           READ_MODEL_EXPORT_GROUPS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.team_scope == 'all' && 'games,players,teams,seasons,indexes' || 'playing' }}
-          SCHEDULE_LOOKBACK_DAYS: '1'
+          SCHEDULE_LOOKBACK_DAYS: '2'
           SCHEDULE_LOOKAHEAD_DAYS: '1'
           READ_MODEL_UPLOAD_WORKERS: ${{ vars.READ_MODEL_UPLOAD_WORKERS || '16' }}
           CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID || vars.CLOUDFRONT_DISTRIBUTION_ID }}
