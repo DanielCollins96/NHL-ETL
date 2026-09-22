@@ -101,6 +101,24 @@ def parse_etl_team_scope(value):
     )
 
 
+def load_all_player_ids(engine):
+    """Return every player ID so full runs can refresh historical landing data."""
+    with engine.connect() as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT "playerId"
+                    FROM newapi.players
+                    WHERE "playerId" IS NOT NULL
+                    ORDER BY "playerId"
+                    """
+                )
+            )
+        ]
+
+
 def merge_partial_rosters(scraped_rosters, existing_rosters, scraped_teams):
     """Keep existing active rosters for teams that were not in this scrape.
 
@@ -168,6 +186,7 @@ async def run_etl_for_db(
     pipelines,
     db_name="primary",
     roster_team_codes=None,
+    team_scope="all",
 ):
     """Run the NHL roster ETL process for a single database."""
     start_time = datetime.now()
@@ -177,6 +196,7 @@ async def run_etl_for_db(
         "roster_records": None,
         "new_call_ups": None,
         "send_downs": None,
+        "landing_players": None,
         "season_skaters": None,
         "season_goalies": None,
         "teams": None,
@@ -273,9 +293,17 @@ async def run_etl_for_db(
             logger.info(f"[{db_name}] Skipping roster staging/sync")
 
         if "players" in pipelines:
-            if len(new_ids) > 0:
-                logger.info(f"[{db_name}] Scraping landing pages for {len(new_ids)} call-up players...")
-                await scraper.scrape_all_players(new_ids, engine)
+            if team_scope == "all":
+                landing_ids = load_all_player_ids(engine)
+                landing_label = f"{len(landing_ids)} players"
+            else:
+                landing_ids = new_ids
+                landing_label = f"{len(landing_ids)} call-up players"
+
+            summary["landing_players"] = len(landing_ids)
+            if landing_ids:
+                logger.info(f"[{db_name}] Scraping landing pages for {landing_label}...")
+                await scraper.scrape_all_players(landing_ids, engine)
                 logger.info(f"[{db_name}] ✓ Player data scraped and loaded to staging")
 
                 logger.info(f"[{db_name}] Running player sync procedures...")
@@ -292,7 +320,26 @@ async def run_etl_for_db(
                 logger.info(f"[{db_name}]   - Syncing awards...")
                 try:
                     with engine.begin() as conn:
-                        conn.execute(text("CALL sync_awards_from_staging()"))
+                        award_ready = conn.execute(
+                            text(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM information_schema.columns
+                                    WHERE table_schema = 'staging1'
+                                      AND table_name = 'award'
+                                      AND column_name = 'playerId'
+                                )
+                                """
+                            )
+                        ).scalar()
+                        if not award_ready:
+                            logger.info(
+                                f"[{db_name}] staging1.award has no playerId column; "
+                                "skipping awards sync"
+                            )
+                        else:
+                            conn.execute(text("CALL sync_awards_from_staging()"))
                 except ProgrammingError as exc:
                     sqlstate = getattr(getattr(exc, "orig", None), "pgcode", None)
                     if sqlstate == "42883":
@@ -304,7 +351,7 @@ async def run_etl_for_db(
                         raise
                 logger.info(f"[{db_name}] ✓ All player sync procedures completed")
             else:
-                logger.info(f"[{db_name}] No new call-ups; skipping player landing scrape")
+                logger.info(f"[{db_name}] No players selected for landing scrape")
         else:
             logger.info(f"[{db_name}] Skipping player detail/awards sync")
         
@@ -776,6 +823,7 @@ async def main():
                 pipelines,
                 db_config["name"],
                 roster_team_codes=playing_teams,
+                team_scope=team_scope,
             )
             succeeded_dbs.append(db_config["name"])
         except Exception as e:
