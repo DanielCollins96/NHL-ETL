@@ -175,6 +175,28 @@ def sanitize_games_dataframe(games_df):
     return games_df, sanitized_columns
 
 
+def call_procedure_if_exists(engine, procedure_name, db_name):
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"CALL {procedure_name}()"))
+    except ProgrammingError as exc:
+        sqlstate = getattr(getattr(exc, "orig", None), "pgcode", None)
+        if sqlstate == "42883":
+            logger.warning(f"[{db_name}] {procedure_name}() not found; skipping")
+            return
+        raise
+
+
+def ensure_club_stats_toi_columns(skaters_df, goalies_df):
+    skaters_df = skaters_df.copy()
+    goalies_df = goalies_df.copy()
+    if "avgTimeOnIcePerGame" not in skaters_df.columns:
+        skaters_df["avgTimeOnIcePerGame"] = pd.Series(pd.NA, index=skaters_df.index, dtype="Float64")
+    if "timeOnIce" not in goalies_df.columns:
+        goalies_df["timeOnIce"] = pd.Series(pd.NA, index=goalies_df.index, dtype="Float64")
+    return skaters_df, goalies_df
+
+
 async def run_etl_for_db(
     engine,
     scraper,
@@ -372,6 +394,7 @@ async def run_etl_for_db(
                     "skipping skater/goalie staging and sync"
                 )
             else:
+                skaters_df, goalies_df = ensure_club_stats_toi_columns(skaters_df, goalies_df)
                 logger.info(f"[{db_name}] Loading season stats to staging tables...")
                 try:
                     with engine.begin() as conn:
@@ -397,6 +420,13 @@ async def run_etl_for_db(
                         conn.execute(text("CALL sync_goalies_from_staging()"))
                     else:
                         logger.info(f"[{db_name}]   - Skipping goalie sync; no staging rows")
+
+                if not skaters_df.empty:
+                    logger.info(f"[{db_name}]   - Syncing season skaters from club-stats...")
+                    call_procedure_if_exists(engine, "sync_season_skaters_from_club_stats", db_name)
+                if not goalies_df.empty:
+                    logger.info(f"[{db_name}]   - Syncing season goalies from club-stats...")
+                    call_procedure_if_exists(engine, "sync_season_goalies_from_club_stats", db_name)
                 logger.info(f"[{db_name}] ✓ Season stats sync completed")
         else:
             logger.info(f"[{db_name}] Skipping current season skater/goalie stats")
