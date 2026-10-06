@@ -21,17 +21,9 @@ ETL_PIPELINES=drafts python run_etl.py
 
 `draft` is also accepted as an alias. The pipeline loads `staging1.drafts` and then calls `sync_drafts_from_staging()`.
 
-## Season stats run order
+## Season stats
 
-`season_stats` is the daily club-stats path (`api-web.nhle.com/v1/club-stats/{team}/{season}/{type}`). Player landing scrape is only for new call-ups (or the full roster on a weekly `ETL_TEAM_SCOPE=all` run). After club-stats land in `newapi.skaters` / `newapi.goalies`, the same pipeline upserts player-page history:
-
-1. Scrape club-stats into `staging1.skaters` / `staging1.goalies` (includes `avgTimeOnIcePerGame` and `timeOnIce` from the NHL payload; the scraper does not drop them).
-2. `CALL sync_skaters_from_staging()` / `CALL sync_goalies_from_staging()` → `newapi.skaters` / `newapi.goalies`.
-3. `CALL sync_season_skaters_from_club_stats()` / `CALL sync_season_goalies_from_club_stats()` → `newapi.season_skater` / `newapi.season_goalie`.
-
-Those last two procedures come from [`sync_season_from_club_stats.sql`](https://github.com/DanielCollins96/nhl-skaters-goalies-table-insert). They map club-stats TOI into `season_skater.avgToi` and `season_goalie.timeOnIce`. Apply that file on RDS before the first daily run that needs them; if a procedure is missing the ETL logs a warning and continues.
-
-This is not a one-off backfill and not a full roster landing re-scrape. Landing `sync_season_*_from_staging()` still runs earlier in the `players` pipeline for call-ups / historical seasons.
+`season_stats` loads club-stats, then calls `sync_skaters_from_staging()` / `sync_goalies_from_staging()`, then `sync_season_skaters_from_club_stats()` / `sync_season_goalies_from_club_stats()`. TOI is `avgTimeOnIcePerGame` / `timeOnIce` from club-stats. Those last two procedures live in nhl-skaters-goalies-table-insert.
 
 ## Multiple Database Connections
 
