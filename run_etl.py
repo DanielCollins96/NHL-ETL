@@ -175,6 +175,99 @@ def sanitize_games_dataframe(games_df):
     return games_df, sanitized_columns
 
 
+def call_procedure_if_exists(engine, procedure_name, db_name, missing_hint=None):
+    """CALL a stored procedure in its own transaction.
+
+    A missing procedure (SQLSTATE 42883) is skipped. The exception is
+    raised outside the transaction so it cannot abort a later CALL.
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"CALL {procedure_name}()"))
+        return True
+    except ProgrammingError as exc:
+        sqlstate = getattr(getattr(exc, "orig", None), "pgcode", None)
+        if sqlstate == "42883":
+            hint = f"; {missing_hint}" if missing_hint else ""
+            logger.warning(
+                f"[{db_name}] {procedure_name}() not found; skipping{hint}"
+            )
+            return False
+        raise
+
+
+CLUB_STATS_SKATER_TOI_COLUMN = "avgTimeOnIcePerGame"
+CLUB_STATS_GOALIE_TOI_COLUMN = "timeOnIce"
+
+
+def ensure_club_stats_toi_columns(skaters_df, goalies_df):
+    """Keep TOI on the club-stats staging frames even if the scrape omits it.
+
+    NHL club-stats already returns avgTimeOnIcePerGame (skaters, seconds) and
+    timeOnIce (goalies, seconds). sync_skaters/goalies_from_staging SELECTs
+    those columns; sync_season_*_from_club_stats maps them to
+    season_skater.avgToi / season_goalie.timeOnIce. If a payload drops TOI,
+    pad nullable columns so staging and the season upsert still run.
+    """
+    skaters_df = skaters_df.copy()
+    goalies_df = goalies_df.copy()
+    if CLUB_STATS_SKATER_TOI_COLUMN not in skaters_df.columns:
+        skaters_df[CLUB_STATS_SKATER_TOI_COLUMN] = pd.Series(
+            pd.NA, index=skaters_df.index, dtype="Float64"
+        )
+    if CLUB_STATS_GOALIE_TOI_COLUMN not in goalies_df.columns:
+        goalies_df[CLUB_STATS_GOALIE_TOI_COLUMN] = pd.Series(
+            pd.NA, index=goalies_df.index, dtype="Float64"
+        )
+    return skaters_df, goalies_df
+
+
+def log_club_stats_toi_columns(skaters_df, goalies_df, db_name):
+    """Record whether club-stats frames still carry compare-critical TOI fields."""
+    skater_toi_present = (
+        CLUB_STATS_SKATER_TOI_COLUMN in skaters_df.columns
+        and not skaters_df.empty
+        and int(skaters_df[CLUB_STATS_SKATER_TOI_COLUMN].notna().sum()) > 0
+    )
+    goalie_toi_present = (
+        CLUB_STATS_GOALIE_TOI_COLUMN in goalies_df.columns
+        and not goalies_df.empty
+        and int(goalies_df[CLUB_STATS_GOALIE_TOI_COLUMN].notna().sum()) > 0
+    )
+    skater_toi_count = (
+        0
+        if skaters_df.empty or CLUB_STATS_SKATER_TOI_COLUMN not in skaters_df.columns
+        else int(skaters_df[CLUB_STATS_SKATER_TOI_COLUMN].notna().sum())
+    )
+    goalie_toi_count = (
+        0
+        if goalies_df.empty or CLUB_STATS_GOALIE_TOI_COLUMN not in goalies_df.columns
+        else int(goalies_df[CLUB_STATS_GOALIE_TOI_COLUMN].notna().sum())
+    )
+    logger.info(
+        f"[{db_name}] Club-stats TOI path: "
+        f"skaters.{CLUB_STATS_SKATER_TOI_COLUMN}="
+        f"{'present' if skater_toi_present else 'empty'} "
+        f"({skater_toi_count}/{len(skaters_df)} rows), "
+        f"goalies.{CLUB_STATS_GOALIE_TOI_COLUMN}="
+        f"{'present' if goalie_toi_present else 'empty'} "
+        f"({goalie_toi_count}/{len(goalies_df)} rows). "
+        "These persist via sync_skaters/goalies_from_staging, then "
+        "sync_season_*_from_club_stats maps them to season_skater.avgToi / "
+        "season_goalie.timeOnIce."
+    )
+    if not skaters_df.empty and not skater_toi_present:
+        logger.warning(
+            f"[{db_name}] Club-stats skaters have no {CLUB_STATS_SKATER_TOI_COLUMN} "
+            "values; season_skater.avgToi will be empty for this run"
+        )
+    if not goalies_df.empty and not goalie_toi_present:
+        logger.warning(
+            f"[{db_name}] Club-stats goalies have no {CLUB_STATS_GOALIE_TOI_COLUMN} "
+            "values; season_goalie.timeOnIce will be empty for this run"
+        )
+
+
 async def run_etl_for_db(
     engine,
     scraper,
@@ -199,6 +292,8 @@ async def run_etl_for_db(
         "landing_players": None,
         "season_skaters": None,
         "season_goalies": None,
+        "season_from_club_stats_skaters": None,
+        "season_from_club_stats_goalies": None,
         "teams": None,
         "drafts": None,
         "games": None,
@@ -372,6 +467,8 @@ async def run_etl_for_db(
                     "skipping skater/goalie staging and sync"
                 )
             else:
+                skaters_df, goalies_df = ensure_club_stats_toi_columns(skaters_df, goalies_df)
+                log_club_stats_toi_columns(skaters_df, goalies_df, db_name)
                 logger.info(f"[{db_name}] Loading season stats to staging tables...")
                 try:
                     with engine.begin() as conn:
@@ -398,6 +495,53 @@ async def run_etl_for_db(
                     else:
                         logger.info(f"[{db_name}]   - Skipping goalie sync; no staging rows")
                 logger.info(f"[{db_name}] ✓ Season stats sync completed")
+
+                # After newapi.skaters/goalies are current, upsert player-page
+                # season history from those club-stats rows. Do not re-scrape
+                # landing for the whole roster. Procedures live in
+                # nhl-skaters-goalies-table-insert sync_season_from_club_stats.sql.
+                # Own transaction so a missing procedure cannot roll back club-stats.
+                club_season_hint = (
+                    "apply sync_season_from_club_stats.sql from "
+                    "nhl-skaters-goalies-table-insert"
+                )
+                logger.info(
+                    f"[{db_name}] Upserting season_skater/season_goalie from club-stats..."
+                )
+                if not skaters_df.empty:
+                    logger.info(
+                        f"[{db_name}]   - Syncing season skaters from club-stats..."
+                    )
+                    if call_procedure_if_exists(
+                        engine,
+                        "sync_season_skaters_from_club_stats",
+                        db_name,
+                        missing_hint=club_season_hint,
+                    ):
+                        summary["season_from_club_stats_skaters"] = True
+                else:
+                    logger.info(
+                        f"[{db_name}]   - Skipping season-skater club-stats upsert; "
+                        "no skater staging rows"
+                    )
+
+                if not goalies_df.empty:
+                    logger.info(
+                        f"[{db_name}]   - Syncing season goalies from club-stats..."
+                    )
+                    if call_procedure_if_exists(
+                        engine,
+                        "sync_season_goalies_from_club_stats",
+                        db_name,
+                        missing_hint=club_season_hint,
+                    ):
+                        summary["season_from_club_stats_goalies"] = True
+                else:
+                    logger.info(
+                        f"[{db_name}]   - Skipping season-goalie club-stats upsert; "
+                        "no goalie staging rows"
+                    )
+                logger.info(f"[{db_name}] ✓ Club-stats → season history upsert finished")
         else:
             logger.info(f"[{db_name}] Skipping current season skater/goalie stats")
         
