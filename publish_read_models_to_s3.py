@@ -20,9 +20,14 @@ Environment:
   SCHEDULE_END_DATE                      Optional YYYY-MM-DD end of the playing window.
   READ_MODEL_EXCLUDE_PREFIXES            Optional comma-separated S3 key prefixes.
   CLOUDFRONT_DISTRIBUTION_ID             Optional distribution to invalidate.
-  CLOUDFRONT_INVALIDATION_MODE           none or wildcard. Defaults to none.
-                                         wildcard submits a single /* path. Per-object
-                                         invalidation is not supported.
+  CLOUDFRONT_INVALIDATION_MODE           none, prefix, batch, or wildcard.
+                                         Defaults to none. prefix/batch (changed is
+                                         an alias) invalidates a capped set of path
+                                         prefixes covering uploaded keys only
+                                         (skip-unchanged). It does not submit one
+                                         path per object and does not use /*.
+                                         wildcard submits a single /* path.
+  CLOUDFRONT_INVALIDATION_MAX_PATHS      Cap for prefix/batch mode. Defaults to 24.
 
 Dependencies:
   pip install boto3 sqlalchemy psycopg2-binary
@@ -82,6 +87,18 @@ S3_CONFIG = Config(
     read_timeout=60,
     retries={"max_attempts": 5, "mode": "standard"},
 )
+DEFAULT_INVALIDATION_MAX_PATHS = 24
+# Collapse large folders first so a playing-window publish does not bill one
+# CloudFront path per player. Keep games/seasons exact longer; never emit /*.
+INVALIDATION_COLLAPSE_PRIORITY = {
+    "players": 0,
+    "indexes": 1,
+    "teams": 2,
+    "contracts": 3,
+    "drafts": 4,
+    "games": 5,
+    "seasons": 6,
+}
 
 
 def env_bool(name, default=False):
@@ -387,27 +404,139 @@ def iter_read_model_rows(engine, include_prefixes, exclude_prefixes):
             yield row["s3_key"], row["payload"]
 
 
-def invalidate_cloudfront(distribution_id, mode):
-    if not distribution_id or mode in {"", "none"}:
+def normalize_invalidation_mode(mode):
+    mode = (mode or "none").strip().lower()
+    if mode in {"", "none"}:
+        return "none"
+    if mode in {"prefix", "batch", "changed"}:
+        return "prefix"
+    if mode == "wildcard":
+        return "wildcard"
+    raise ValueError(
+        "CLOUDFRONT_INVALIDATION_MODE must be none, prefix, batch, or wildcard"
+    )
+
+
+def cloudfront_url_path(s3_key):
+    return "/" + str(s3_key).lstrip("/")
+
+
+def invalidation_bucket_root(bucket_prefix):
+    prefix = (bucket_prefix or "").strip("/")
+    return f"/{prefix}" if prefix else ""
+
+
+def invalidation_parent_dirs(cf_path, bucket_root=""):
+    """Directory prefixes a CloudFront path can collapse into, excluding /*."""
+    if cf_path.endswith("/*"):
+        parts = [part for part in cf_path[:-2].split("/") if part]
+        dir_parts = parts[:-1]
+    else:
+        parts = [part for part in cf_path.split("/") if part]
+        dir_parts = parts[:-1]
+
+    parents = []
+    acc = []
+    for part in dir_parts:
+        acc.append(part)
+        parent = "/" + "/".join(acc)
+        if parent != bucket_root:
+            parents.append(parent)
+    return parents
+
+
+def invalidation_root_name(parent, bucket_root=""):
+    rel = parent
+    if bucket_root and (parent == bucket_root or parent.startswith(bucket_root + "/")):
+        rel = parent[len(bucket_root) :]
+    rel = rel.lstrip("/")
+    return rel.split("/")[0] if rel else ""
+
+
+def collapse_invalidation_paths(uploaded_keys, bucket_prefix="", max_paths=DEFAULT_INVALIDATION_MAX_PATHS):
+    """Cover uploaded S3 keys with <= max_paths CloudFront paths.
+
+    Uses exact paths when the playing window changed a small set of objects.
+    Collapses the costliest folders (players, then indexes/teams) into one
+    prefix wildcard each. Never bills one path per player, and never uses /*.
+    """
+    if max_paths < 1:
+        raise ValueError("CLOUDFRONT_INVALIDATION_MAX_PATHS must be at least 1")
+
+    paths = sorted({cloudfront_url_path(key) for key in uploaded_keys if str(key).strip()})
+    bucket_root = invalidation_bucket_root(bucket_prefix)
+
+    while len(paths) > max_paths:
+        coverage = {}
+        for path in paths:
+            for parent in invalidation_parent_dirs(path, bucket_root):
+                coverage.setdefault(parent, set()).add(path)
+        coverage = {parent: children for parent, children in coverage.items() if len(children) >= 2}
+        if not coverage:
+            logger.warning(
+                "Cannot collapse CloudFront paths below %s without using /*; keeping %s paths",
+                max_paths,
+                len(paths),
+            )
+            break
+
+        def collapse_key(parent):
+            root = invalidation_root_name(parent, bucket_root)
+            return (
+                INVALIDATION_COLLAPSE_PRIORITY.get(root, 3),
+                -len(parent),
+                -len(coverage[parent]),
+                parent,
+            )
+
+        parent = min(coverage, key=collapse_key)
+        covered = coverage[parent]
+        paths = sorted({path for path in paths if path not in covered} | {f"{parent}/*"})
+
+    return paths
+
+
+def invalidation_paths_for_uploads(
+    uploaded_keys,
+    mode,
+    bucket_prefix="",
+    max_paths=DEFAULT_INVALIDATION_MAX_PATHS,
+):
+    mode = normalize_invalidation_mode(mode)
+    if mode == "none":
+        return []
+    if mode == "wildcard":
+        return ["/*"]
+    return collapse_invalidation_paths(uploaded_keys, bucket_prefix, max_paths)
+
+
+def invalidate_cloudfront(distribution_id, mode, uploaded_keys=None, bucket_prefix=""):
+    if not distribution_id:
         return
 
-    if mode == "changed":
-        logger.warning(
-            "CLOUDFRONT_INVALIDATION_MODE=changed is disabled to avoid per-object billing; using wildcard /* instead"
-        )
-        mode = "wildcard"
+    mode = normalize_invalidation_mode(mode)
+    if mode == "none":
+        return
 
-    if mode != "wildcard":
-        raise ValueError("CLOUDFRONT_INVALIDATION_MODE must be none or wildcard")
+    max_paths = env_int("CLOUDFRONT_INVALIDATION_MAX_PATHS", default=DEFAULT_INVALIDATION_MAX_PATHS)
+    paths = invalidation_paths_for_uploads(
+        uploaded_keys or [],
+        mode,
+        bucket_prefix=bucket_prefix,
+        max_paths=max_paths,
+    )
+    if not paths:
+        logger.info("Skipping CloudFront invalidation because no paths were selected")
+        return
 
     cloudfront = boto3.client("cloudfront", config=S3_CONFIG)
-    logger.info("Creating CloudFront invalidation for 1 path: /*")
+    logger.info("Creating CloudFront invalidation for %s paths: %s", len(paths), paths)
     cloudfront.create_invalidation(
         DistributionId=distribution_id,
         InvalidationBatch={
             "Paths": {
-                "Quantity": 1,
-                "Items": ["/*"],
+                "Quantity": len(paths),
+                "Items": paths,
             },
             "CallerReference": f"read-models-{int(time.time())}",
         },
@@ -554,7 +683,9 @@ def publish_read_models_to_s3(engine, db_name="primary"):
     if not dry_run and uploaded_keys:
         invalidate_cloudfront(
             os.getenv("CLOUDFRONT_DISTRIBUTION_ID"),
-            os.getenv("CLOUDFRONT_INVALIDATION_MODE", "none").strip().lower(),
+            os.getenv("CLOUDFRONT_INVALIDATION_MODE", "none"),
+            uploaded_keys,
+            prefix,
         )
     elif not dry_run:
         logger.info("[%s] Skipping CloudFront invalidation because no objects were uploaded", db_name)
