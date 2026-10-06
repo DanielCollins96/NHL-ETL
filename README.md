@@ -44,6 +44,8 @@ The GitHub Actions workflow runs `publish_read_models_to_s3.py` after a successf
 
 The daily job uses `READ_MODEL_EXPORT_GROUPS=playing`: only the schedule-window games (yesterday, today, and tomorrow by default), those teams, their rostered players, the current season page, and the related indexes. Historical players/games/seasons stay untouched. The weekly full scrape still publishes `games,players,teams,seasons,indexes`. Drafts and contracts stay off both jobs.
 
+After a daily publish, CloudFront invalidation defaults to `prefix`: a capped batch of path prefixes covering uploaded keys only. Unchanged objects are not invalidated. That is not a `/*` purge and is not one CloudFront path per S3 object.
+
 A manual daily run with team scope `all` also publishes the full catalog.
 
 Required GitHub Actions config:
@@ -52,13 +54,14 @@ Required GitHub Actions config:
 READ_MODEL_S3_BUCKET
 READ_MODEL_S3_PREFIX                 # optional, e.g. hockey-read-models
 CLOUDFRONT_DISTRIBUTION_ID           # optional
-CLOUDFRONT_INVALIDATION_MODE         # optional; none or wildcard
+CLOUDFRONT_INVALIDATION_MODE         # optional; none, prefix/batch, or wildcard
 ```
 
 Those can live in Actions secrets or variables. The AWS OIDC role already used by this workflow also needs:
 
 - `s3:PutObject` on the read-model bucket objects
 - `s3:ListBucket` on the read-model bucket (used for unchanged-upload ETag checks)
+- `cloudfront:CreateInvalidation` on the distribution, if `CLOUDFRONT_DISTRIBUTION_ID` is set
 
 To publish locally after the database sync and read-model SQL views have been refreshed:
 
@@ -79,6 +82,7 @@ Common environment variables:
 READ_MODEL_S3_BUCKET=your-bucket
 READ_MODEL_S3_PREFIX=optional/prefix
 CLOUDFRONT_DISTRIBUTION_ID=optional-distribution-id
-# none, or wildcard for a single /* invalidation. Per-object invalidation is not used.
+# none, prefix/batch for a capped set of uploaded-key prefixes, or wildcard for /*.
+# Daily ETL defaults to prefix. Unchanged keys are not invalidated. Empty distribution id is a no-op.
 CLOUDFRONT_INVALIDATION_MODE=none
 ```

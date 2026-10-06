@@ -84,7 +84,7 @@ jobs:
           SCHEDULE_LOOKAHEAD_DAYS: '0'
           READ_MODEL_UPLOAD_WORKERS: ${{ vars.READ_MODEL_UPLOAD_WORKERS || '16' }}
           CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID || vars.CLOUDFRONT_DISTRIBUTION_ID }}
-          CLOUDFRONT_INVALIDATION_MODE: ${{ vars.CLOUDFRONT_INVALIDATION_MODE || 'none' }}
+          CLOUDFRONT_INVALIDATION_MODE: ${{ vars.CLOUDFRONT_INVALIDATION_MODE || 'prefix' }}
       
       - name: Remove IP from RDS Security Group
         if: always()  # Runs even if previous steps fail
