@@ -3,7 +3,7 @@ name: NHL Daily ETL
 
 on:
   schedule:
-    - cron: '0 1,18 * * *'  # 1 AM UTC and 11 AM MST (18:00 UTC)
+    - cron: '0 6,22 * * *'  # 11 PM and 3 PM MST (06:00, 22:00 UTC)
   workflow_dispatch:  # Manual trigger from GitHub UI
     inputs:
       team_scope:
