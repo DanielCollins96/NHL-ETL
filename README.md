@@ -2,6 +2,8 @@
 
 Automating a scrape with the NHLScraper Python package
 
+Moving the database off RDS? See [docs/rds-to-supabase.md](docs/rds-to-supabase.md).
+
 ## Steps
 
 Start by running the upsert scripts to initialize the database: https://github.com/DanielCollins96/nhl-skaters-goalies-table-insert
