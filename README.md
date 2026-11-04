@@ -40,7 +40,7 @@ The ETL will run sequentially against all configured databases. The primary data
 
 ## Publishing Read Models
 
-The GitHub Actions workflow runs `publish_read_models_to_s3.py` after a successful database sync, while the runner IP is still allowed through RDS. It publishes from the primary database (`DB_CONNECTION`) only.
+The GitHub Actions workflow runs `publish_read_models_to_s3.py` after a successful database sync. It publishes from the primary database (`DB_CONNECTION`) only.
 
 The daily job uses `READ_MODEL_EXPORT_GROUPS=playing`: only the schedule-window games (yesterday, today, and tomorrow by default), those teams, their rostered players, the current season page, and the related indexes. Historical players/games/seasons stay untouched. The weekly full scrape still publishes `games,players,teams,seasons,indexes`. Drafts and contracts stay off both jobs.
 

@@ -26,29 +26,11 @@ jobs:
       - name: Checkout ETL repo
         uses: actions/checkout@v4
       
-      - name: Get Runner IP
-        id: ip
-        run: echo "ipv4=$(curl -s https://api.ipify.org)" >> $GITHUB_OUTPUT
-      
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-west-2
-      
-      - name: Add IP to RDS Security Group
-        run: |
-          RUNNER_IP="${{ steps.ip.outputs.ipv4 }}"
-          SECURITY_GROUP_ID="${{ secrets.RDS_SECURITY_GROUP_ID }}"
-          
-          echo "Adding IP ${RUNNER_IP}/32 to security group ${SECURITY_GROUP_ID}"
-          
-          aws ec2 authorize-security-group-ingress \
-            --group-id $SECURITY_GROUP_ID \
-            --protocol tcp \
-            --port 5432 \
-            --cidr ${RUNNER_IP}/32 \
-            --tag-specifications "ResourceType=security-group-rule,Tags=[{Key=ManagedBy,Value=GitHubActions},{Key=CreatedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)}]" 2>&1 || echo "Rule may already exist"
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -85,17 +67,3 @@ jobs:
           READ_MODEL_UPLOAD_WORKERS: ${{ vars.READ_MODEL_UPLOAD_WORKERS || '16' }}
           CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID || vars.CLOUDFRONT_DISTRIBUTION_ID }}
           CLOUDFRONT_INVALIDATION_MODE: ${{ vars.CLOUDFRONT_INVALIDATION_MODE || 'none' }}
-      
-      - name: Remove IP from RDS Security Group
-        if: always()  # Runs even if previous steps fail
-        run: |
-          RUNNER_IP="${{ steps.ip.outputs.ipv4 }}"
-          SECURITY_GROUP_ID="${{ secrets.RDS_SECURITY_GROUP_ID }}"
-          
-          echo "Removing IP ${RUNNER_IP}/32 from security group ${SECURITY_GROUP_ID}"
-          
-          aws ec2 revoke-security-group-ingress \
-            --group-id $SECURITY_GROUP_ID \
-            --protocol tcp \
-            --port 5432 \
-            --cidr ${RUNNER_IP}/32 2>&1 || echo "Rule may not exist or already removed"
