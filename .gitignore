@@ -11,3 +11,7 @@ env/
 # IDE files
 .vscode/
 .idea/
+
+# Migration dumps and logs (scripts/migrate_rds_to_supabase.sh)
+migration-*/
+*.dump
