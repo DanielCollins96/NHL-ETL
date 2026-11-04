@@ -313,12 +313,21 @@ class StepReport:
         self.planned = planned_steps(pipelines)
         self.results = {}
 
+    def _already_failed(self, name):
+        existing = self.results.get(name)
+        return bool(existing and existing["status"] == "FAILED")
+
     def ok(self, name, detail=""):
+        # A later success in the same step must not hide an earlier failure.
+        if self._already_failed(name):
+            return
         self.results[name] = {"status": "OK", "detail": detail}
 
     def skip(self, name, why, means=""):
         detail = _join_reason(why, means)
         logger.warning(f"[{self.db_name}] Skipping {step_label(name)}: {detail}")
+        if self._already_failed(name):
+            return
         self.results[name] = {"status": "SKIPPED", "detail": detail}
 
     def fail(self, name, why, exc=None, means="Later pipelines will still run."):
