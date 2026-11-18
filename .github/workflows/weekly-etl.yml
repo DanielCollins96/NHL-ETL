@@ -73,6 +73,35 @@ jobs:
           READ_MODEL_UPLOAD_WORKERS: ${{ vars.READ_MODEL_UPLOAD_WORKERS || '16' }}
           CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID || vars.CLOUDFRONT_DISTRIBUTION_ID }}
           CLOUDFRONT_INVALIDATION_MODE: ${{ vars.CLOUDFRONT_INVALIDATION_MODE || 'none' }}
+
+      - name: Check out nextjs-hockey for the fantasy build
+        uses: actions/checkout@v4
+        with:
+          repository: DanielCollins96/nextjs-hockey
+          path: nextjs-hockey
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: 'nextjs-hockey/package-lock.json'
+
+      # Hits and blocked shots come from the NHL API, not Postgres, so the
+      # fantasy pools are built by the app's Node script rather than the publisher.
+      - name: Publish fantasy read models to S3
+        working-directory: nextjs-hockey
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          # node-postgres does not understand SQLAlchemy's +psycopg2 driver suffix.
+          DATABASE_URL="${DB_CONNECTION/+psycopg2/}"
+          echo "::add-mask::$DATABASE_URL"
+          export DATABASE_URL
+          node scripts/build-fantasy-read-models.mjs
+        env:
+          DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
+          READ_MODEL_S3_BUCKET: ${{ secrets.READ_MODEL_S3_BUCKET || vars.READ_MODEL_S3_BUCKET }}
+          READ_MODEL_S3_PREFIX: ${{ secrets.READ_MODEL_S3_PREFIX || vars.READ_MODEL_S3_PREFIX }}
       
       - name: Remove IP from RDS Security Group
         if: always()  # Runs even if previous steps fail
