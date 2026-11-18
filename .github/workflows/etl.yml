@@ -13,6 +13,10 @@ on:
           - playing
           - all
         default: playing
+      nextjs_hockey_ref:
+        description: nextjs-hockey branch to run the fantasy build from
+        type: string
+        default: main
 
 permissions:
   id-token: write  # Required for OIDC authentication with AWS
@@ -91,6 +95,7 @@ jobs:
         with:
           repository: DanielCollins96/nextjs-hockey
           path: nextjs-hockey
+          ref: ${{ github.event.inputs.nextjs_hockey_ref || 'main' }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
