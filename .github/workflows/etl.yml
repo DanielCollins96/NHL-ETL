@@ -110,9 +110,12 @@ jobs:
         working-directory: nextjs-hockey
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
-          # Node does not ship the RDS CA, so sslmode=require cannot verify the cluster cert without it.
+          # Node ships neither the RDS CA nor Supabase's, so sslmode=require can't verify
+          # either server without them. Trust both, so this works whichever one
+          # DB_CONNECTION points at.
           curl -fsSL -o "$RUNNER_TEMP/rds-global-bundle.pem" https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
-          export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/rds-global-bundle.pem"
+          cat "$RUNNER_TEMP/rds-global-bundle.pem" "$GITHUB_WORKSPACE/certs/prod-ca-2021.crt" > "$RUNNER_TEMP/db-ca-bundle.pem"
+          export NODE_EXTRA_CA_CERTS="$RUNNER_TEMP/db-ca-bundle.pem"
           # node-postgres does not understand SQLAlchemy's +psycopg2 driver suffix.
           DATABASE_URL="${DB_CONNECTION/+psycopg2/}"
           echo "::add-mask::$DATABASE_URL"
