@@ -64,6 +64,7 @@ jobs:
           ETL_TEAM_SCOPE: all
 
       - name: Publish read models to S3
+        if: success() || failure()
         run: python publish_read_models_to_s3.py
         env:
           DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
